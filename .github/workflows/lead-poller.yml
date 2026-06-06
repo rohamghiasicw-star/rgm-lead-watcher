@@ -6,7 +6,12 @@ name: RGM Lead Watcher
 on:
   schedule:
     - cron: "*/15 * * * *"
-  workflow_dispatch: {}   # lets you run it manually from the Actions tab to test
+  workflow_dispatch:       # lets you run it manually from the Actions tab
+    inputs:
+      selftest:
+        description: "Run connection self-test (sends a Telegram check message)"
+        type: boolean
+        default: false
 
 # Avoid overlapping runs if one is slow.
 concurrency:
@@ -28,4 +33,4 @@ jobs:
         env:
           COMPOSIO_API_KEY: ${{ secrets.COMPOSIO_API_KEY }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python poller.py
+        run: python poller.py ${{ inputs.selftest && '--selftest' || '' }}

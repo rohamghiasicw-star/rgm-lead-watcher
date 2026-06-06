@@ -236,10 +236,50 @@ def poll_gmail():
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
+def selftest():
+    """Ping every connected account + send a Telegram confirmation.
+    Proves the full chain works without needing a real lead to have just arrived."""
+    print("[SELFTEST] verifying every connection...")
+    results = []
+
+    fb = composio_execute(
+        "FACEBOOK_GET_PAGE_CONVERSATIONS",
+        {"page_id": FB_PAGE_ID, "fields": "id,updated_time", "limit": 1}, FB_ACCOUNT)
+    results.append(("Facebook", "data" in fb, len(fb.get("data", []))))
+
+    ig = composio_execute("INSTAGRAM_LIST_ALL_CONVERSATIONS", {"limit": 1}, IG_ACCOUNT)
+    results.append(("Instagram", "data" in ig, len(ig.get("data", []))))
+
+    for acct in GMAIL_ACCOUNTS:
+        gm = composio_execute(
+            "GMAIL_FETCH_EMAILS",
+            {"query": 'subject:"Top 10 in"', "label_ids": ["INBOX"],
+             "max_results": 1, "verbose": False}, acct)
+        results.append((f"Gmail {acct}", "messages" in gm or "nextPageToken" in gm, 0))
+
+    lines = [f"{'OK ' if ok else 'FAIL'}  {name}" for name, ok, _ in results]
+    all_ok = all(ok for _, ok, _ in results)
+    for ln in lines:
+        print("  " + ln)
+
+    composio_execute(
+        "TELEGRAM_SEND_MESSAGE",
+        {"chat_id": TELEGRAM_CHAT_ID,
+         "text": "RGM Lead Watcher - self-test\n" + "\n".join(lines) +
+                 ("\n\nAll systems go. Live alerts are on." if all_ok
+                  else "\n\nSome connection failed - check the log.")},
+        TELEGRAM_ACCOUNT)
+    print("[SELFTEST] " + ("PASSED" if all_ok else "FAILED — see above"))
+    sys.exit(0 if all_ok else 1)
+
+
 def main():
     if not API_KEY:
         print("[FATAL] COMPOSIO_API_KEY is not set.")
         sys.exit(1)
+
+    if "--selftest" in sys.argv:
+        selftest()
 
     print(f"[RUN] {NOW.isoformat()}  lookback={LOOKBACK_MIN}m  cutoff={CUTOFF.isoformat()}")
 
