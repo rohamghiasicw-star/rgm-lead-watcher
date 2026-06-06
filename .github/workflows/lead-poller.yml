@@ -46,16 +46,20 @@ jobs:
           fi
           git config user.name "rgm-lead-watcher"
           git config user.email "actions@users.noreply.github.com"
-          END=$(( $(date +%s) + 20400 ))    # ~5h40m of 15-min polls, then exit & get restarted
+          END=$(( $(date +%s) + 20400 ))    # ~5h40m, then exit & get restarted by the schedule
+          i=0
           while [ "$(date +%s)" -lt "$END" ]; do
-            echo "::group::poll $(date -u +%FT%TZ)"
-            python poller.py || true
-            if [ -n "$(git status --porcelain state.json)" ]; then
+            echo "::group::poll $(date -u +%FT%TZ) i=$i"
+            # speed-critical channels every ~60s; full sweep (incl. 6 cold inboxes) every ~5 min
+            if [ $(( i % 5 )) -eq 0 ]; then python poller.py || true; else python poller.py --fast || true; fi
+            # persist state ~every 5 min so a restart resumes without re-alerting
+            if [ $(( i % 5 )) -eq 0 ] && [ -n "$(git status --porcelain state.json)" ]; then
               git add state.json
               git commit -m "state [skip ci]" >/dev/null 2>&1
               git pull --rebase --autostash >/dev/null 2>&1
               git push >/dev/null 2>&1 || true
             fi
             echo "::endgroup::"
-            sleep 900
+            i=$(( i + 1 ))
+            sleep 60
           done

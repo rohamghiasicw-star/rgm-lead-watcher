@@ -415,9 +415,15 @@ def main():
         CUTOFF = NOW - dt.timedelta(minutes=LOOKBACK_MIN)
     GMAIL_FRESH_H = max(1, int((NOW - CUTOFF).total_seconds() // 3600) + 2)
 
-    print(f"[RUN] {NOW.isoformat()} since={CUTOFF.isoformat()} last_run={state.get('last_run')} seen={len(seen)}")
+    # --fast = speed-critical channels only (run frequently); cold replies are less
+    # time-sensitive and hit 6 inboxes, so the loop runs them less often.
+    fns = [poll_facebook, poll_instagram, poll_wix, poll_meta]
+    if "--fast" not in sys.argv:
+        fns.append(poll_cold)
+
+    print(f"[RUN] {NOW.isoformat()} since={CUTOFF.isoformat()} last_run={state.get('last_run')} seen={len(seen)} fast={'--fast' in sys.argv}")
     leads = []
-    for fn in (poll_facebook, poll_instagram, poll_wix, poll_meta, poll_cold):
+    for fn in fns:
         try:
             leads.extend(fn(mcp))
         except Exception as e:
