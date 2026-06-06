@@ -26,7 +26,7 @@ import urllib.error
 # ----------------------------------------------------------------------------
 MCP_URL = "https://connect.composio.dev/mcp"
 CONSUMER_KEY = os.environ.get("COMPOSIO_CONSUMER_KEY", "").strip()
-TELEGRAM_CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", "8295197275"))
+TELEGRAM_CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID") or "8295197275")
 
 # Cron runs every 15 min; 20 gives a safety overlap so a lead is never missed if
 # a run is slightly delayed. Worst case = a rare duplicate at the boundary.
