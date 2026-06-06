@@ -29,9 +29,9 @@ COMPOSIO_BASE = "https://backend.composio.dev/api/v3"
 API_KEY = os.environ.get("COMPOSIO_API_KEY", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "8295197275").strip()
 
-# How far back to look (minutes). Cron runs every 15 min; 20 gives a safety overlap
+# How far back to look (minutes). Cron runs every 30 min; 35 gives a safety overlap
 # so a lead is never missed if a run is slightly delayed. Worst case = a rare repeat.
-LOOKBACK_MIN = int(os.environ.get("LOOKBACK_MIN", "20"))
+LOOKBACK_MIN = int(os.environ.get("LOOKBACK_MIN", "35"))
 
 # Connected-account IDs from Composio (the accounts we wired up).
 FB_ACCOUNT = "facebook_cyanol-tret"

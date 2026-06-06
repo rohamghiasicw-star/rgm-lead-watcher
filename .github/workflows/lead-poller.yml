@@ -1,11 +1,12 @@
 name: RGM Lead Watcher
 
-# Runs every 15 minutes on GitHub's servers (works while your laptop is off).
+# Runs every 30 minutes on GitHub's servers (works while your laptop is off).
+# 30 min keeps a PRIVATE repo within the free 2,000 Actions-minutes/month.
 # GitHub cron is in UTC and can lag a few minutes under load - the script's
-# 20-minute lookback window covers that so no lead is missed.
+# 35-minute lookback window covers that so no lead is missed.
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/30 * * * *"
   workflow_dispatch:       # lets you run it manually from the Actions tab
     inputs:
       selftest:
