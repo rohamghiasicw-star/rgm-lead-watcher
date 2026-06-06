@@ -159,6 +159,9 @@ def maps_link(company, city):
     return f"https://www.google.com/maps/search/?api=1&query={q}"
 
 
+DRY_RUN = False  # set by --dryrun: detect + print, but do NOT send Telegram
+
+
 def send_telegram(mcp, source, lead):
     name, company, city, phone = (lead.get("name", "?"), lead.get("company", ""),
                                   lead.get("city", ""), lead.get("phone", ""))
@@ -166,6 +169,9 @@ def send_telegram(mcp, source, lead):
     text = (f"NEW LEAD ({source})\n{name}"
             + (f"\n{who}" if who else "")
             + f"\nPhone: {phone}\nGBP check: {maps_link(company, city)}")
+    if DRY_RUN:
+        print(f"[WOULD ALERT] {source}: {name} / {company} / {city} / {phone}")
+        return
     mcp.execute("TELEGRAM_SEND_MESSAGE", {"chat_id": TELEGRAM_CHAT_ID, "text": text})
     print(f"[SENT] {source}: {name} / {company} / {phone}")
 
@@ -272,6 +278,10 @@ def main():
 
     if "--selftest" in sys.argv:
         selftest(mcp)
+
+    global DRY_RUN
+    if "--dryrun" in sys.argv:
+        DRY_RUN = True
 
     print(f"[RUN] {NOW.isoformat()} lookback={LOOKBACK_MIN}m cutoff={CUTOFF.isoformat()}")
     leads = []
