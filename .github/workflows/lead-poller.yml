@@ -50,9 +50,9 @@ jobs:
           i=0
           while [ "$(date +%s)" -lt "$END" ]; do
             echo "::group::poll $(date -u +%FT%TZ) i=$i"
-            # speed-critical channels every ~60s; full sweep (incl. 6 cold inboxes) every ~5 min
+            # speed-critical channels every ~3 min; full sweep (incl. 6 cold inboxes) every ~15 min
             if [ $(( i % 5 )) -eq 0 ]; then python poller.py || true; else python poller.py --fast || true; fi
-            # persist state ~every 5 min so a restart resumes without re-alerting
+            # persist state ~every 15 min so a restart resumes without re-alerting
             if [ $(( i % 5 )) -eq 0 ] && [ -n "$(git status --porcelain state.json)" ]; then
               git add state.json
               git commit -m "state [skip ci]" >/dev/null 2>&1
@@ -61,5 +61,5 @@ jobs:
             fi
             echo "::endgroup::"
             i=$(( i + 1 ))
-            sleep 60
+            sleep 180
           done
