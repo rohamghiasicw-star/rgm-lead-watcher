@@ -3,20 +3,25 @@
 RGM Lead Watcher
 ----------------
 Runs on GitHub Actions every 15 minutes (cloud-hosted, works with your laptop off).
-Each run it checks Facebook Messenger, Instagram DMs, and Gmail for NEW leads that
-arrived in the last ~20 minutes, and sends one Telegram message per new lead.
+Each run it checks for NEW leads from the last ~20 minutes and sends ONE Telegram
+message per new lead. Silent when there's nothing new.
 
-It reuses the connections already set up in Composio, reached through Composio's
-MCP endpoint with your CONSUMER key (ck_...). The only secret needed:
+Lead sources:
+  - Facebook Messenger (RGM page)  - lead-form DMs
+  - Instagram DMs (@rgm_marketing_) - lead-form DMs
+  - Wix website contact form -> no-reply@crm.wix.com -> rohamghiasicw@gmail.com
 
-  COMPOSIO_CONSUMER_KEY  - required, your Composio consumer key (ck_...)
-  TELEGRAM_CHAT_ID       - optional, defaults to the value below
+Reuses the Composio connections via the MCP endpoint + your CONSUMER key (ck_...).
+Secrets:
+  COMPOSIO_CONSUMER_KEY  - required (ck_...)
+  TELEGRAM_CHAT_ID       - optional (defaults below)
 """
 
 import os
 import re
 import sys
 import json
+import base64
 import datetime as dt
 import urllib.request
 import urllib.error
@@ -27,22 +32,17 @@ import urllib.error
 MCP_URL = "https://connect.composio.dev/mcp"
 CONSUMER_KEY = os.environ.get("COMPOSIO_CONSUMER_KEY", "").strip()
 TELEGRAM_CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID") or "8295197275")
-
-# Cron runs every 15 min; 20 gives a safety overlap so a lead is never missed if
-# a run is slightly delayed. Worst case = a rare duplicate at the boundary.
 LOOKBACK_MIN = int(os.environ.get("LOOKBACK_MIN", "20"))
 
 FB_PAGE_ID = "114357208375877"          # RGM page
 IG_ACCOUNT = "rgm-business"             # @rgm_marketing_
 IG_SELF_USERNAME = "rgm_marketing_"
-GMAIL_ACCOUNTS = [                      # the three ghiasi@ inboxes
-    "gmail_glady-emmer",                # ghiasi@rghiasi.ca
-    "gmail_seeder-soally",              # ghiasi@rohamresults.ca
-    "gmail_michel-burrow",              # ghiasi@rohamresultsrg.ca
-]
+WIX_INBOX = "gmail_incog-wur"           # rohamghiasicw@gmail.com (gets the Wix form leads)
 
 NOW = dt.datetime.now(dt.timezone.utc)
 CUTOFF = NOW - dt.timedelta(minutes=LOOKBACK_MIN)
+GMAIL_FRESH_H = max(1, (LOOKBACK_MIN + 59) // 60 + 1)  # Gmail search window, tracks lookback
+DRY_RUN = False
 
 
 # ----------------------------------------------------------------------------
@@ -51,11 +51,9 @@ CUTOFF = NOW - dt.timedelta(minutes=LOOKBACK_MIN)
 class MCP:
     def __init__(self, url, key):
         self.url = url
-        self.headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-            "X-Consumer-API-Key": key,
-        }
+        self.headers = {"Content-Type": "application/json",
+                        "Accept": "application/json, text/event-stream",
+                        "X-Consumer-API-Key": key}
         self.session = None
         self._id = 0
         self._handshake()
@@ -64,16 +62,15 @@ class MCP:
         h = dict(self.headers)
         if self.session:
             h["mcp-session-id"] = self.session
-        req = urllib.request.Request(
-            self.url, data=json.dumps(payload).encode(), headers=h, method="POST")
+        req = urllib.request.Request(self.url, data=json.dumps(payload).encode(),
+                                     headers=h, method="POST")
         try:
             r = urllib.request.urlopen(req, timeout=90)
         except urllib.error.HTTPError as e:
             print(f"[MCP HTTP {e.code}] {e.read().decode()[:300]}")
             return None, {}
-        raw = r.read().decode()
         body = None
-        for line in raw.splitlines():
+        for line in r.read().decode().splitlines():
             if line.startswith("data:"):
                 try:
                     body = json.loads(line[5:].strip())
@@ -81,31 +78,27 @@ class MCP:
                     pass
         return body, dict(r.headers)
 
-    def _next_id(self):
+    def _nid(self):
         self._id += 1
         return self._id
 
     def _handshake(self):
-        _, hdrs = self._post({
-            "jsonrpc": "2.0", "id": self._next_id(), "method": "initialize",
+        _, hdrs = self._post({"jsonrpc": "2.0", "id": self._nid(), "method": "initialize",
             "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-                       "clientInfo": {"name": "rgm-lead-watcher", "version": "1"}}})
+                       "clientInfo": {"name": "rgm-lead-watcher", "version": "2"}}})
         self.session = hdrs.get("mcp-session-id") or hdrs.get("Mcp-Session-Id")
         self._post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
 
     def execute(self, tool_slug, arguments, account=None):
-        """Run one Composio tool via COMPOSIO_MULTI_EXECUTE_TOOL; return its `data` dict."""
         item = {"tool_slug": tool_slug, "arguments": arguments}
         if account:
             item["account"] = account
-        res, _ = self._post({
-            "jsonrpc": "2.0", "id": self._next_id(), "method": "tools/call",
+        res, _ = self._post({"jsonrpc": "2.0", "id": self._nid(), "method": "tools/call",
             "params": {"name": "COMPOSIO_MULTI_EXECUTE_TOOL", "arguments": {
                 "thought": "lead poll", "current_step": "POLL",
                 "sync_response_to_workbench": False, "tools": [item]}}})
         try:
-            text = res["result"]["content"][0]["text"]
-            payload = json.loads(text)
+            payload = json.loads(res["result"]["content"][0]["text"])
             r0 = payload["data"]["results"][0]["response"]
             if not r0.get("successful", True):
                 print(f"[WARN] {tool_slug}: {str(r0.get('error'))[:200]}")
@@ -135,23 +128,54 @@ def parse_ts(value):
         return None
 
 
-LEAD_FIELDS = {
-    "name": re.compile(r"Full name:\s*(.+)", re.I),
-    "company": re.compile(r"Company name:\s*(.+)", re.I),
-    "phone": re.compile(r"Phone number:\s*(.+)", re.I),
-    "city": re.compile(r"City:\s*(.+)", re.I),
-}
+# --- FB/IG lead form ("Phone number:" style) -------------------------------
+FORM_FIELDS = {"name": r"Full name:\s*(.+)", "company": r"Company name:\s*(.+)",
+               "phone": r"Phone number:\s*(.+)", "city": r"City:\s*(.+)"}
 
 
-def parse_lead_form(text):
+def parse_dm_form(text):
     if not text or "phone number:" not in text.lower():
         return None
     out = {}
-    for key, rx in LEAD_FIELDS.items():
-        m = rx.search(text)
+    for k, rx in FORM_FIELDS.items():
+        m = re.search(rx, text, re.I)
         if m:
-            out[key] = m.group(1).strip()
+            out[k] = m.group(1).strip()
     return out or None
+
+
+# --- Wix contact-form email ------------------------------------------------
+WIX_LABELS = {"first name": "first", "last name": "last", "name": "name",
+              "business email": "email", "email": "email",
+              "company name": "company", "company": "company",
+              "phone": "phone", "phone number": "phone",
+              "short answer": "note", "message": "note", "subject": "note"}
+
+
+_WIX_STOPS = ("First name|Last name|Business Email|Email|Company name|Company|"
+              "Phone number|Phone|Short answer|Message|Subject")
+
+
+def parse_wix(snippet):
+    """Parse the inline Gmail snippet of a Wix contact-form notification.
+    Reliable for name/email/company; phone shows up when it fits in the snippet."""
+    if not snippet:
+        return None
+
+    def grab(label):
+        m = re.search(label + r"\s*:\s*(.+?)(?=\s+(?:" + _WIX_STOPS + r")\s*:|$)", snippet, re.I)
+        return m.group(1).strip() if m else ""
+
+    first = grab("First name") or grab("Name")
+    last = grab("Last name")
+    email = grab("Business Email") or grab("Email")
+    company = grab("Company name") or grab("Company")
+    phone = grab("Phone number") or grab("Phone")
+    if not (first or email or phone):
+        return None
+    name = " ".join(x for x in [first, last] if x) or "(no name)"
+    return {"name": name, "company": company, "city": "",
+            "phone": phone, "email": email, "note": ""}
 
 
 def maps_link(company, city):
@@ -159,26 +183,32 @@ def maps_link(company, city):
     return f"https://www.google.com/maps/search/?api=1&query={q}"
 
 
-DRY_RUN = False  # set by --dryrun: detect + print, but do NOT send Telegram
-
-
 def send_telegram(mcp, source, lead):
-    name, company, city, phone = (lead.get("name", "?"), lead.get("company", ""),
-                                  lead.get("city", ""), lead.get("phone", ""))
-    who = " - ".join(x for x in [company, city] if x)
-    text = (f"NEW LEAD ({source})\n{name}"
-            + (f"\n{who}" if who else "")
-            + f"\nPhone: {phone}\nGBP check: {maps_link(company, city)}")
+    who = " - ".join(x for x in [lead.get("name"), lead.get("company")] if x) or lead.get("name", "(lead)")
+    parts = [f"NEW LEAD ({source})", who]
+    if lead.get("phone"):
+        parts.append("Phone: " + lead["phone"])
+    if lead.get("email"):
+        parts.append("Email: " + lead["email"])
+    if lead.get("note"):
+        parts.append(lead["note"])
+    if lead.get("company") or lead.get("city"):
+        parts.append("GBP check: " + maps_link(lead.get("company", ""), lead.get("city", "")))
+    if lead.get("link"):
+        parts.append("Open email (full details/phone): " + lead["link"])
     if DRY_RUN:
-        print(f"[WOULD ALERT] {source}: {name} / {company} / {city} / {phone}")
+        print(f"[WOULD ALERT] {source}: {who} | {lead.get('phone','')} | {lead.get('email','')}")
         return
-    mcp.execute("TELEGRAM_SEND_MESSAGE", {"chat_id": TELEGRAM_CHAT_ID, "text": text})
-    print(f"[SENT] {source}: {name} / {company} / {phone}")
+    mcp.execute("TELEGRAM_SEND_MESSAGE", {"chat_id": TELEGRAM_CHAT_ID, "text": "\n".join(parts)})
+    print(f"[SENT] {source}: {who}")
 
 
 # ----------------------------------------------------------------------------
 # Source pollers
 # ----------------------------------------------------------------------------
+OLD = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+
+
 def poll_facebook(mcp):
     leads = []
     data = mcp.execute("FACEBOOK_GET_PAGE_CONVERSATIONS",
@@ -192,9 +222,9 @@ def poll_facebook(mcp):
         for m in msgs.get("data", []):
             if (m.get("from") or {}).get("id") == FB_PAGE_ID:
                 continue
-            if (parse_ts(m.get("created_time")) or dt.datetime.min.replace(tzinfo=dt.timezone.utc)) < CUTOFF:
+            if (parse_ts(m.get("created_time")) or OLD) < CUTOFF:
                 continue
-            lead = parse_lead_form(m.get("message", ""))
+            lead = parse_dm_form(m.get("message", ""))
             if lead:
                 leads.append(("Facebook", lead, m.get("id")))
     return leads
@@ -211,34 +241,28 @@ def poll_instagram(mcp):
         for m in msgs.get("data", []):
             if (m.get("from") or {}).get("username") == IG_SELF_USERNAME:
                 continue
-            if (parse_ts(m.get("created_time")) or dt.datetime.min.replace(tzinfo=dt.timezone.utc)) < CUTOFF:
+            if (parse_ts(m.get("created_time")) or OLD) < CUTOFF:
                 continue
-            lead = parse_lead_form(m.get("message", ""))
+            lead = parse_dm_form(m.get("message", ""))
             if lead:
                 leads.append(("Instagram", lead, m.get("id")))
     return leads
 
 
-def poll_gmail(mcp):
+def poll_wix(mcp):
+    """Website contact-form leads: no-reply@crm.wix.com -> rohamghiasicw@gmail.com."""
     leads = []
-    for acct in GMAIL_ACCOUNTS:
-        data = mcp.execute("GMAIL_FETCH_EMAILS",
-                           {"query": 'subject:"Top 10 in" newer_than:1h',
-                            "label_ids": ["INBOX"], "max_results": 15, "verbose": True}, acct)
-        for msg in data.get("messages", []) or []:
-            ts = parse_ts(msg.get("messageTimestamp"))
-            if ts is None or ts < CUTOFF:
-                continue
-            sender = msg.get("sender", "")
-            if "roham" in sender.lower() or "ghiasi" in sender.lower():
-                continue
-            city = ""
-            mc = re.search(r"Top 10 in\s+(.+)", msg.get("subject", ""), re.I)
-            if mc:
-                city = mc.group(1).strip()
-            leads.append(("Gmail reply",
-                          {"name": sender, "company": "", "city": city, "phone": "(see email)"},
-                          msg.get("messageId")))
+    listing = mcp.execute("GMAIL_FETCH_EMAILS",
+                          {"query": f"from:crm.wix.com newer_than:{GMAIL_FRESH_H}h", "label_ids": ["INBOX"],
+                           "max_results": 15, "verbose": True}, WIX_INBOX)
+    for msg in listing.get("messages", []) or []:
+        if (parse_ts(msg.get("messageTimestamp") or msg.get("internalDate")) or OLD) < CUTOFF:
+            continue
+        snippet = (msg.get("preview") or {}).get("body") or msg.get("messageText", "")
+        lead = parse_wix(snippet)
+        if lead:
+            lead["link"] = msg.get("display_url", "")
+            leads.append(("Website form", lead, msg.get("messageId")))
     return leads
 
 
@@ -246,26 +270,25 @@ def poll_gmail(mcp):
 # Self-test + main
 # ----------------------------------------------------------------------------
 def selftest(mcp):
-    print("[SELFTEST] verifying every connection...")
+    print("[SELFTEST] verifying connections...")
     checks = []
     fb = mcp.execute("FACEBOOK_GET_PAGE_CONVERSATIONS",
                      {"page_id": FB_PAGE_ID, "fields": "id,updated_time", "limit": 1})
     checks.append(("Facebook", "data" in fb))
     ig = mcp.execute("INSTAGRAM_LIST_ALL_CONVERSATIONS", {"limit": 1}, IG_ACCOUNT)
     checks.append(("Instagram", "data" in ig))
-    for acct in GMAIL_ACCOUNTS:
-        gm = mcp.execute("GMAIL_FETCH_EMAILS",
-                         {"query": 'subject:"Top 10 in"', "label_ids": ["INBOX"],
-                          "max_results": 1, "verbose": False}, acct)
-        checks.append((f"Gmail {acct}", ("messages" in gm or "nextPageToken" in gm)))
+    wx = mcp.execute("GMAIL_FETCH_EMAILS",
+                     {"query": "from:crm.wix.com", "label_ids": ["INBOX"], "max_results": 1, "verbose": False},
+                     WIX_INBOX)
+    checks.append(("Wix form inbox", ("messages" in wx or "nextPageToken" in wx)))
     lines = [f"{'OK  ' if ok else 'FAIL'} {n}" for n, ok in checks]
     all_ok = all(ok for _, ok in checks)
     for ln in lines:
         print("  " + ln)
     mcp.execute("TELEGRAM_SEND_MESSAGE", {"chat_id": TELEGRAM_CHAT_ID,
         "text": "RGM Lead Watcher - self-test\n" + "\n".join(lines)
-                + ("\n\nAll systems go. Live alerts every 15 min." if all_ok
-                   else "\n\nSomething failed - check the log.")})
+                + ("\n\nWatching: FB DMs, IG DMs, Wix website form. Only texts on a real new lead."
+                   if all_ok else "\n\nSomething failed - check the log.")})
     print("[SELFTEST] " + ("PASSED" if all_ok else "FAILED"))
     sys.exit(0 if all_ok else 1)
 
@@ -285,7 +308,7 @@ def main():
 
     print(f"[RUN] {NOW.isoformat()} lookback={LOOKBACK_MIN}m cutoff={CUTOFF.isoformat()}")
     leads = []
-    for fn in (poll_facebook, poll_instagram, poll_gmail):
+    for fn in (poll_facebook, poll_instagram, poll_wix):
         try:
             leads.extend(fn(mcp))
         except Exception as e:
