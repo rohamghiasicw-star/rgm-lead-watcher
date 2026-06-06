@@ -1,0 +1,31 @@
+name: RGM Lead Watcher
+
+# Runs every 15 minutes on GitHub's servers (works while your laptop is off).
+# GitHub cron is in UTC and can lag a few minutes under load - the script's
+# 20-minute lookback window covers that so no lead is missed.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}   # lets you run it manually from the Actions tab to test
+
+# Avoid overlapping runs if one is slow.
+concurrency:
+  group: lead-watcher
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run lead poller
+        env:
+          COMPOSIO_API_KEY: ${{ secrets.COMPOSIO_API_KEY }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python poller.py
