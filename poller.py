@@ -60,9 +60,29 @@ EXCLUDE_SENDERS = ("noreply", "no-reply", "donotreply", "notification", "mailer-
                    "atlassian", "linkedin", "intuit", "glassdoor", "calendly")
 
 NOW = dt.datetime.now(dt.timezone.utc)
+STATE_FILE = os.environ.get("STATE_FILE", "state.json")
+MAX_LOOKBACK_H = 72                  # safety cap if runs were paused a long time
+# CUTOFF / GMAIL_FRESH_H are refined in main() from saved state so we never miss a
+# lead in the gap between irregular GitHub-cron runs. These are just fallbacks.
 CUTOFF = NOW - dt.timedelta(minutes=LOOKBACK_MIN)
-GMAIL_FRESH_H = max(1, (LOOKBACK_MIN + 59) // 60 + 1)  # Gmail search window, tracks lookback
+GMAIL_FRESH_H = max(1, (LOOKBACK_MIN + 59) // 60 + 1)
 DRY_RUN = False
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        print(f"[WARN] could not write {STATE_FILE}: {e}")
 
 
 # ----------------------------------------------------------------------------
@@ -301,6 +321,26 @@ def parse_cold_reply(msg):
             "link": msg.get("display_url", "")}
 
 
+def poll_meta(mcp):
+    """Facebook Lead Ads: Meta emails 'N new lead(s) available for RGM' (no contact in the
+    email - it lives in Meta Lead Center, so we notify + link to it)."""
+    leads = []
+    listing = mcp.execute("GMAIL_FETCH_EMAILS",
+                          {"query": f"from:business.facebook.com subject:lead newer_than:{GMAIL_FRESH_H}h",
+                           "label_ids": ["INBOX"], "max_results": 15, "verbose": True}, WIX_INBOX)
+    for msg in listing.get("messages", []) or []:
+        if (parse_ts(msg.get("messageTimestamp") or msg.get("internalDate")) or OLD) < CUTOFF:
+            continue
+        subj = msg.get("subject", "")
+        m = re.search(r"(\d+)\s+new lead", subj, re.I)
+        n = m.group(1) if m else "New"
+        lead = {"name": f"{n} Facebook lead-ad lead(s) for RGM", "company": "", "city": "",
+                "phone": "", "email": "", "note": "Contact info is in Meta Lead Center - tap to open",
+                "link": msg.get("display_url", "")}
+        leads.append(("Facebook Lead Ad", lead, msg.get("messageId")))
+    return leads
+
+
 def poll_cold(mcp):
     """A reply to one of YOUR outreach campaigns, landing in a cold-outreach inbox = a lead."""
     leads = []
@@ -345,8 +385,9 @@ def selftest(mcp):
         print("  " + ln)
     mcp.execute("TELEGRAM_SEND_MESSAGE", {"chat_id": TELEGRAM_CHAT_ID,
         "text": "RGM Lead Watcher - self-test\n" + "\n".join(lines)
-                + ("\n\nWatching: FB DMs, IG DMs, Wix website form, + cold-outreach replies in 6 inboxes."
-                   " Only texts on a real new lead." if all_ok else "\n\nSomething failed - check the log.")})
+                + ("\n\nWatching: FB DMs, IG DMs, Facebook lead-ads, Wix website form, + cold-outreach"
+                   " replies in 6 inboxes. Only texts on a real new lead."
+                   if all_ok else "\n\nSomething failed - check the log.")})
     print("[SELFTEST] " + ("PASSED" if all_ok else "FAILED"))
     sys.exit(0 if all_ok else 1)
 
@@ -360,27 +401,42 @@ def main():
     if "--selftest" in sys.argv:
         selftest(mcp)
 
-    global DRY_RUN
+    global DRY_RUN, CUTOFF, GMAIL_FRESH_H
     if "--dryrun" in sys.argv:
         DRY_RUN = True
 
-    print(f"[RUN] {NOW.isoformat()} lookback={LOOKBACK_MIN}m cutoff={CUTOFF.isoformat()}")
+    # Resume from the last run so irregular cron spacing never leaves a blind gap.
+    state = load_state()
+    seen = dict(state.get("seen", {}))           # message_id -> iso timestamp seen
+    last_run = parse_ts(state.get("last_run"))
+    if last_run and "--dryrun" not in sys.argv:
+        CUTOFF = max(last_run - dt.timedelta(minutes=30), NOW - dt.timedelta(hours=MAX_LOOKBACK_H))
+    else:
+        CUTOFF = NOW - dt.timedelta(minutes=LOOKBACK_MIN)
+    GMAIL_FRESH_H = max(1, int((NOW - CUTOFF).total_seconds() // 3600) + 2)
+
+    print(f"[RUN] {NOW.isoformat()} since={CUTOFF.isoformat()} last_run={state.get('last_run')} seen={len(seen)}")
     leads = []
-    for fn in (poll_facebook, poll_instagram, poll_wix, poll_cold):
+    for fn in (poll_facebook, poll_instagram, poll_wix, poll_meta, poll_cold):
         try:
             leads.extend(fn(mcp))
         except Exception as e:
             print(f"[ERROR] {fn.__name__}: {e}")
 
-    seen, new = set(), 0
+    new = 0
     for source, lead, did in leads:
         key = did or json.dumps(lead, sort_keys=True)
         if key in seen:
             continue
-        seen.add(key)
         send_telegram(mcp, source, lead)
+        seen[key] = NOW.isoformat()
         new += 1
     print(f"[DONE] {new} new lead(s) sent." if new else "[DONE] No new leads.")
+
+    if not DRY_RUN:
+        cut14 = NOW - dt.timedelta(days=14)
+        seen = {k: v for k, v in seen.items() if (parse_ts(v) or NOW) >= cut14}
+        save_state({"last_run": NOW.isoformat(), "seen": seen})
 
 
 if __name__ == "__main__":
