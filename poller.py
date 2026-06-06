@@ -37,7 +37,27 @@ LOOKBACK_MIN = int(os.environ.get("LOOKBACK_MIN", "20"))
 FB_PAGE_ID = "114357208375877"          # RGM page
 IG_ACCOUNT = "rgm-business"             # @rgm_marketing_
 IG_SELF_USERNAME = "rgm_marketing_"
-WIX_INBOX = "gmail_incog-wur"           # rohamghiasicw@gmail.com (gets the Wix form leads)
+WIX_INBOX = "gmail_incog-wur"   # rohamghiasicw@gmail.com - Wix website-form leads land here
+
+# The agency inboxes that SEND cold outreach. A human reply landing here = a lead.
+COLD_INBOXES = [
+    "gmail_seeder-soally",  # ghiasi@rohamresults.ca
+    "gmail_tonant-reflow",  # roham@rghiasi.ca
+    "gmail_michel-burrow",  # ghiasi@rohamresultsrg.ca
+    "gmail_glady-emmer",    # ghiasi@rghiasi.ca
+    "gmail_affect-unique",  # rg@rohamresults.ca
+    "gmail_yahgan-ganoid",  # rg@rohamresultsrg.ca
+]
+# Your cold-outreach campaign subject line(s). A reply to one of these = a real
+# prospect - anchoring on this keeps out the cold spam these inboxes also receive.
+# Add more subjects here as you run new campaigns.
+CAMPAIGN_SUBJECTS = ["Top 10 in"]
+
+# Senders that are never a real reply (automation, your own domains, big platforms).
+EXCLUDE_SENDERS = ("noreply", "no-reply", "donotreply", "notification", "mailer-daemon",
+                   "postmaster", "rohamresults", "rghiasi", "ghiasi@", "roham@",
+                   "google.com", "facebook", "wix.com", "paypal", "github",
+                   "atlassian", "linkedin", "intuit", "glassdoor", "calendly")
 
 NOW = dt.datetime.now(dt.timezone.utc)
 CUTOFF = NOW - dt.timedelta(minutes=LOOKBACK_MIN)
@@ -169,6 +189,8 @@ def parse_wix(snippet):
     first = grab("First name") or grab("Name")
     last = grab("Last name")
     email = grab("Business Email") or grab("Email")
+    em = re.search(r"[\w.+-]+@[\w.-]+\.\w+", email)   # keep just the address
+    email = em.group(0) if em else email
     company = grab("Company name") or grab("Company")
     phone = grab("Phone number") or grab("Phone")
     if not (first or email or phone):
@@ -186,6 +208,8 @@ def maps_link(company, city):
 def send_telegram(mcp, source, lead):
     who = " - ".join(x for x in [lead.get("name"), lead.get("company")] if x) or lead.get("name", "(lead)")
     parts = [f"NEW LEAD ({source})", who]
+    if lead.get("subject"):
+        parts.append('"' + lead["subject"] + '"')
     if lead.get("phone"):
         parts.append("Phone: " + lead["phone"])
     if lead.get("email"):
@@ -253,8 +277,8 @@ def poll_wix(mcp):
     """Website contact-form leads: no-reply@crm.wix.com -> rohamghiasicw@gmail.com."""
     leads = []
     listing = mcp.execute("GMAIL_FETCH_EMAILS",
-                          {"query": f"from:crm.wix.com newer_than:{GMAIL_FRESH_H}h", "label_ids": ["INBOX"],
-                           "max_results": 15, "verbose": True}, WIX_INBOX)
+                          {"query": f"from:crm.wix.com newer_than:{GMAIL_FRESH_H}h",
+                           "label_ids": ["INBOX"], "max_results": 15, "verbose": True}, WIX_INBOX)
     for msg in listing.get("messages", []) or []:
         if (parse_ts(msg.get("messageTimestamp") or msg.get("internalDate")) or OLD) < CUTOFF:
             continue
@@ -263,6 +287,34 @@ def poll_wix(mcp):
         if lead:
             lead["link"] = msg.get("display_url", "")
             leads.append(("Website form", lead, msg.get("messageId")))
+    return leads
+
+
+def parse_cold_reply(msg):
+    sender = msg.get("sender", "")
+    m = re.match(r'\s*"?([^"<]*?)"?\s*<([^>]+)>', sender)
+    name = (m.group(1).strip() if m else sender).strip() or sender
+    email = m.group(2).strip() if m else ""
+    return {"name": name or email or "(reply)", "company": "", "city": "", "phone": "",
+            "email": email, "subject": msg.get("subject", ""),
+            "note": ((msg.get("preview") or {}).get("body") or "")[:180],
+            "link": msg.get("display_url", "")}
+
+
+def poll_cold(mcp):
+    """A reply to one of YOUR outreach campaigns, landing in a cold-outreach inbox = a lead."""
+    leads = []
+    subj = " OR ".join(f'subject:"{s}"' for s in CAMPAIGN_SUBJECTS)
+    query = f"in:inbox newer_than:{GMAIL_FRESH_H}h ({subj})"
+    for acct in COLD_INBOXES:
+        listing = mcp.execute("GMAIL_FETCH_EMAILS",
+                              {"query": query, "label_ids": ["INBOX"], "max_results": 15, "verbose": True}, acct)
+        for msg in listing.get("messages", []) or []:
+            if (parse_ts(msg.get("messageTimestamp") or msg.get("internalDate")) or OLD) < CUTOFF:
+                continue
+            if any(x in msg.get("sender", "").lower() for x in EXCLUDE_SENDERS):
+                continue
+            leads.append(("Cold-outreach reply", parse_cold_reply(msg), msg.get("messageId")))
     return leads
 
 
@@ -281,14 +333,20 @@ def selftest(mcp):
                      {"query": "from:crm.wix.com", "label_ids": ["INBOX"], "max_results": 1, "verbose": False},
                      WIX_INBOX)
     checks.append(("Wix form inbox", ("messages" in wx or "nextPageToken" in wx)))
+    cold_ok = 0
+    for acct in COLD_INBOXES:
+        c = mcp.execute("GMAIL_FETCH_EMAILS",
+                        {"query": "in:inbox", "label_ids": ["INBOX"], "max_results": 1, "verbose": False}, acct)
+        cold_ok += 1 if ("messages" in c or "nextPageToken" in c) else 0
+    checks.append((f"Cold-outreach inboxes ({cold_ok}/{len(COLD_INBOXES)})", cold_ok == len(COLD_INBOXES)))
     lines = [f"{'OK  ' if ok else 'FAIL'} {n}" for n, ok in checks]
     all_ok = all(ok for _, ok in checks)
     for ln in lines:
         print("  " + ln)
     mcp.execute("TELEGRAM_SEND_MESSAGE", {"chat_id": TELEGRAM_CHAT_ID,
         "text": "RGM Lead Watcher - self-test\n" + "\n".join(lines)
-                + ("\n\nWatching: FB DMs, IG DMs, Wix website form. Only texts on a real new lead."
-                   if all_ok else "\n\nSomething failed - check the log.")})
+                + ("\n\nWatching: FB DMs, IG DMs, Wix website form, + cold-outreach replies in 6 inboxes."
+                   " Only texts on a real new lead." if all_ok else "\n\nSomething failed - check the log.")})
     print("[SELFTEST] " + ("PASSED" if all_ok else "FAILED"))
     sys.exit(0 if all_ok else 1)
 
@@ -308,7 +366,7 @@ def main():
 
     print(f"[RUN] {NOW.isoformat()} lookback={LOOKBACK_MIN}m cutoff={CUTOFF.isoformat()}")
     leads = []
-    for fn in (poll_facebook, poll_instagram, poll_wix):
+    for fn in (poll_facebook, poll_instagram, poll_wix, poll_cold):
         try:
             leads.extend(fn(mcp))
         except Exception as e:
