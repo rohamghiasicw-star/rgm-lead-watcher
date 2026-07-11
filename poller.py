@@ -10,6 +10,7 @@ Lead sources:
   - Facebook Messenger (RGM page)  - lead-form DMs
   - Instagram DMs (@rgm_marketing_) - lead-form DMs
   - Wix website contact form -> no-reply@crm.wix.com -> rohamghiasicw@gmail.com
+  - Cold-outreach replies -> Instantly unibox (ScaledMail inboxes -> Instantly)
 
 Reuses the Composio connections via the MCP endpoint + your CONSUMER key (ck_...).
 Secrets:
@@ -39,19 +40,10 @@ IG_ACCOUNT = "rgm-business"             # @rgm_marketing_
 IG_SELF_USERNAME = "rgm_marketing_"
 WIX_INBOX = "gmail_incog-wur"   # rohamghiasicw@gmail.com - Wix website-form leads land here
 
-# The agency inboxes that SEND cold outreach. A human reply landing here = a lead.
-COLD_INBOXES = [
-    "gmail_seeder-soally",  # ghiasi@rohamresults.ca
-    "gmail_tonant-reflow",  # roham@rghiasi.ca
-    "gmail_michel-burrow",  # ghiasi@rohamresultsrg.ca
-    "gmail_glady-emmer",    # ghiasi@rghiasi.ca
-    "gmail_affect-unique",  # rg@rohamresults.ca
-    "gmail_yahgan-ganoid",  # rg@rohamresultsrg.ca
-]
-# Your cold-outreach campaign subject line(s). A reply to one of these = a real
-# prospect - anchoring on this keeps out the cold spam these inboxes also receive.
-# Add more subjects here as you run new campaigns.
-CAMPAIGN_SUBJECTS = ["Top 10 in"]
+# Cold outreach now sends via Instantly (ScaledMail inboxes -> Instantly). Prospect
+# replies land in the Instantly unibox, NOT in the old per-inbox Gmail accounts (those
+# were disconnected from Composio 2026-07). A focused "received" email = a real reply.
+INSTANTLY_ACCOUNT = "instantly_sprite-olax"   # Composio Instantly connection
 
 # Senders that are never a real reply (automation, your own domains, big platforms).
 EXCLUDE_SENDERS = ("noreply", "no-reply", "donotreply", "notification", "mailer-daemon",
@@ -310,17 +302,6 @@ def poll_wix(mcp):
     return leads
 
 
-def parse_cold_reply(msg):
-    sender = msg.get("sender", "")
-    m = re.match(r'\s*"?([^"<]*?)"?\s*<([^>]+)>', sender)
-    name = (m.group(1).strip() if m else sender).strip() or sender
-    email = m.group(2).strip() if m else ""
-    return {"name": name or email or "(reply)", "company": "", "city": "", "phone": "",
-            "email": email, "subject": msg.get("subject", ""),
-            "note": ((msg.get("preview") or {}).get("body") or "")[:180],
-            "link": msg.get("display_url", "")}
-
-
 def poll_meta(mcp):
     """Facebook Lead Ads: Meta emails 'N new lead(s) available for RGM' (no contact in the
     email - it lives in Meta Lead Center, so we notify + link to it)."""
@@ -341,20 +322,29 @@ def poll_meta(mcp):
     return leads
 
 
-def poll_cold(mcp):
-    """A reply to one of YOUR outreach campaigns, landing in a cold-outreach inbox = a lead."""
+def poll_instantly(mcp):
+    """A reply to one of YOUR cold campaigns now lands in the Instantly unibox.
+    A focused 'received' email = a real prospect reply. Instantly's focused filter
+    keeps out the cold spam the sending inboxes also collect."""
     leads = []
-    subj = " OR ".join(f'subject:"{s}"' for s in CAMPAIGN_SUBJECTS)
-    query = f"in:inbox newer_than:{GMAIL_FRESH_H}h ({subj})"
-    for acct in COLD_INBOXES:
-        listing = mcp.execute("GMAIL_FETCH_EMAILS",
-                              {"query": query, "label_ids": ["INBOX"], "max_results": 15, "verbose": True}, acct)
-        for msg in listing.get("messages", []) or []:
-            if (parse_ts(msg.get("messageTimestamp") or msg.get("internalDate")) or OLD) < CUTOFF:
-                continue
-            if any(x in msg.get("sender", "").lower() for x in EXCLUDE_SENDERS):
-                continue
-            leads.append(("Cold-outreach reply", parse_cold_reply(msg), msg.get("messageId")))
+    data = mcp.execute("INSTANTLY_LIST_EMAILS",
+                       {"email_type": "received", "mode": "emode_focused",
+                        "limit": 25, "sort_order": "desc"}, INSTANTLY_ACCOUNT)
+    for msg in data.get("items", []) or []:
+        if (parse_ts(msg.get("timestamp_created") or msg.get("timestamp_email")) or OLD) < CUTOFF:
+            continue
+        email = (msg.get("from_address_email") or "").strip()
+        if any(x in email.lower() for x in EXCLUDE_SENDERS):
+            continue
+        frm = msg.get("from_address_json") or []
+        name = (frm[0].get("name") or "").strip() if frm and isinstance(frm, list) else ""
+        if not name or "@" in name:
+            name = email.split("@")[0] if email else "(reply)"
+        note = (msg.get("content_preview") or (msg.get("body") or {}).get("text") or "").strip()[:180]
+        lead = {"name": name, "company": "", "city": "", "phone": "", "email": email,
+                "subject": msg.get("subject", ""), "note": note,
+                "link": "https://app.instantly.ai/app/unibox"}
+        leads.append(("Cold-email reply", lead, msg.get("id") or msg.get("message_id")))
     return leads
 
 
@@ -373,12 +363,9 @@ def selftest(mcp):
                      {"query": "from:crm.wix.com", "label_ids": ["INBOX"], "max_results": 1, "verbose": False},
                      WIX_INBOX)
     checks.append(("Wix form inbox", ("messages" in wx or "nextPageToken" in wx)))
-    cold_ok = 0
-    for acct in COLD_INBOXES:
-        c = mcp.execute("GMAIL_FETCH_EMAILS",
-                        {"query": "in:inbox", "label_ids": ["INBOX"], "max_results": 1, "verbose": False}, acct)
-        cold_ok += 1 if ("messages" in c or "nextPageToken" in c) else 0
-    checks.append((f"Cold-outreach inboxes ({cold_ok}/{len(COLD_INBOXES)})", cold_ok == len(COLD_INBOXES)))
+    inst = mcp.execute("INSTANTLY_LIST_EMAILS",
+                       {"email_type": "received", "mode": "emode_focused", "limit": 1}, INSTANTLY_ACCOUNT)
+    checks.append(("Instantly unibox (cold replies)", "items" in inst))
     lines = [f"{'OK  ' if ok else 'FAIL'} {n}" for n, ok in checks]
     all_ok = all(ok for _, ok in checks)
     for ln in lines:
@@ -386,7 +373,7 @@ def selftest(mcp):
     mcp.execute("TELEGRAM_SEND_MESSAGE", {"chat_id": TELEGRAM_CHAT_ID,
         "text": "RGM Lead Watcher - self-test\n" + "\n".join(lines)
                 + ("\n\nWatching: FB DMs, IG DMs, Facebook lead-ads, Wix website form, + cold-outreach"
-                   " replies in 6 inboxes. Only texts on a real new lead."
+                   " replies in the Instantly unibox. Only texts on a real new lead."
                    if all_ok else "\n\nSomething failed - check the log.")})
     print("[SELFTEST] " + ("PASSED" if all_ok else "FAILED"))
     sys.exit(0 if all_ok else 1)
@@ -415,11 +402,9 @@ def main():
         CUTOFF = NOW - dt.timedelta(minutes=LOOKBACK_MIN)
     GMAIL_FRESH_H = max(1, int((NOW - CUTOFF).total_seconds() // 3600) + 2)
 
-    # --fast = speed-critical channels only (run frequently); cold replies are less
-    # time-sensitive and hit 6 inboxes, so the loop runs them less often.
-    fns = [poll_facebook, poll_instagram, poll_wix, poll_meta]
-    if "--fast" not in sys.argv:
-        fns.append(poll_cold)
+    # All channels are cheap single calls now (Instantly replaced the 6 Gmail inboxes),
+    # so every poll runs the full set - replies alert as fast as DMs. --fast is a no-op.
+    fns = [poll_facebook, poll_instagram, poll_wix, poll_meta, poll_instantly]
 
     print(f"[RUN] {NOW.isoformat()} since={CUTOFF.isoformat()} last_run={state.get('last_run')} seen={len(seen)} fast={'--fast' in sys.argv}")
     leads = []
