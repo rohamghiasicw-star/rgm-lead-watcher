@@ -49,7 +49,8 @@ INSTANTLY_ACCOUNT = "instantly_sprite-olax"   # Composio Instantly connection
 EXCLUDE_SENDERS = ("noreply", "no-reply", "donotreply", "notification", "mailer-daemon",
                    "postmaster", "rohamresults", "rghiasi", "ghiasi@", "roham@",
                    "google.com", "facebook", "wix.com", "paypal", "github",
-                   "atlassian", "linkedin", "intuit", "glassdoor", "calendly")
+                   "atlassian", "linkedin", "intuit", "glassdoor", "calendly",
+                   "usebouncer.com", "instantly.ai", "scaledmail")
 
 NOW = dt.datetime.now(dt.timezone.utc)
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
