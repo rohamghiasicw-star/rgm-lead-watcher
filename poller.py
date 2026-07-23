@@ -349,20 +349,31 @@ def poll_instantly(mcp):
                         "limit": 10, "sort_order": "desc"}, INSTANTLY_ACCOUNT)
     items = data.get("items", []) or []
     for msg in items:
-        if (parse_ts(msg.get("timestamp_created") or msg.get("timestamp_email")) or OLD) < CUTOFF:
+        if not isinstance(msg, dict):
             continue
-        email = (msg.get("from_address_email") or "").strip()
-        if any(x in email.lower() for x in EXCLUDE_SENDERS):
+        try:
+            if (parse_ts(msg.get("timestamp_created") or msg.get("timestamp_email")) or OLD) < CUTOFF:
+                continue
+            email = (msg.get("from_address_email") or "").strip()
+            if any(x in email.lower() for x in EXCLUDE_SENDERS):
+                continue
+            frm = msg.get("from_address_json") or []
+            first = frm[0] if isinstance(frm, list) and frm and isinstance(frm[0], dict) else {}
+            name = (first.get("name") or "").strip()
+            if not name or "@" in name:
+                name = email.split("@")[0] if email else "(reply)"
+            # `body` is usually {"text","html"} but emode_all's "Others" items sometimes
+            # return it as a bare string - handle both so one odd item can't kill the poll.
+            body = msg.get("body")
+            body_text = body.get("text") if isinstance(body, dict) else (body if isinstance(body, str) else "")
+            note = (msg.get("content_preview") or body_text or "").strip()[:180]
+            lead = {"name": name, "company": "", "city": "", "phone": "", "email": email,
+                    "subject": msg.get("subject", ""), "note": note,
+                    "link": "https://app.instantly.ai/app/unibox"}
+            leads.append(("Cold-email reply", lead, msg.get("id") or msg.get("message_id")))
+        except Exception as e:
+            print(f"[WARN] instantly item skipped: {e}")
             continue
-        frm = msg.get("from_address_json") or []
-        name = (frm[0].get("name") or "").strip() if frm and isinstance(frm, list) else ""
-        if not name or "@" in name:
-            name = email.split("@")[0] if email else "(reply)"
-        note = (msg.get("content_preview") or (msg.get("body") or {}).get("text") or "").strip()[:180]
-        lead = {"name": name, "company": "", "city": "", "phone": "", "email": email,
-                "subject": msg.get("subject", ""), "note": note,
-                "link": "https://app.instantly.ai/app/unibox"}
-        leads.append(("Cold-email reply", lead, msg.get("id") or msg.get("message_id")))
     # Visibility: len(items)==0 here is the offload-bug signature; anything >0 means the
     # Instantly channel is genuinely being read.
     print(f"[instantly] {len(items)} received item(s) read, {len(leads)} candidate reply lead(s) in window")
