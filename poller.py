@@ -334,15 +334,18 @@ def poll_meta(mcp):
 
 
 def poll_instantly(mcp):
-    """A reply to one of YOUR cold campaigns now lands in the Instantly unibox.
-    A focused 'received' email = a real prospect reply. Instantly's focused filter
-    keeps out the cold spam the sending inboxes also collect."""
+    """ANY reply that lands in the Instantly unibox -> a Telegram ping. Roham wants
+    every human reply, interested or not ("no thanks" / "remove me" / out-of-office
+    all count), so we read `emode_all` (Focused AND Others) - not just Focused, which
+    was hiding half the replies. EXCLUDE_SENDERS still drops the non-replies: literal
+    noreply/mailer-daemon automation, his own sending domains, and his own SaaS
+    account notifications (Bouncer/Instantly/ScaledMail)."""
     leads = []
     # Keep limit modest: full email bodies are heavy, so a smaller pull is more likely
     # to come back inline (full `data`) rather than as an offloaded `data_preview`.
     # execute() falls back to the preview either way, which is newest-first - fine here.
     data = mcp.execute("INSTANTLY_LIST_EMAILS",
-                       {"email_type": "received", "mode": "emode_focused",
+                       {"email_type": "received", "mode": "emode_all",
                         "limit": 10, "sort_order": "desc"}, INSTANTLY_ACCOUNT)
     items = data.get("items", []) or []
     for msg in items:
@@ -385,10 +388,10 @@ def selftest(mcp):
     # comes back inline, so it masked the offload bug that broke the real limit:25 poll.
     # Requiring items>0 makes a future offload regression fail the self-test loudly.
     inst = mcp.execute("INSTANTLY_LIST_EMAILS",
-                       {"email_type": "received", "mode": "emode_focused",
+                       {"email_type": "received", "mode": "emode_all",
                         "limit": 10, "sort_order": "desc"}, INSTANTLY_ACCOUNT)
     n_inst = len(inst.get("items", []) or [])
-    checks.append((f"Instantly unibox (cold replies) - read {n_inst} recent", n_inst > 0))
+    checks.append((f"Instantly unibox (all replies) - read {n_inst} recent", n_inst > 0))
     lines = [f"{'OK  ' if ok else 'FAIL'} {n}" for n, ok in checks]
     all_ok = all(ok for _, ok in checks)
     for ln in lines:
