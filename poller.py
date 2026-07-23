@@ -134,7 +134,17 @@ class MCP:
             r0 = payload["data"]["results"][0]["response"]
             if not r0.get("successful", True):
                 print(f"[WARN] {tool_slug}: {str(r0.get('error'))[:200]}")
-            return r0.get("data", {}) or {}
+            # Composio auto-offloads LARGE tool responses to its workbench sandbox and
+            # returns only a truncated `data_preview` (newest items first) INSTEAD of a
+            # populated `data`. INSTANTLY_LIST_EMAILS carries full email bodies, so it
+            # trips this once the unibox has a handful of replies - and reading `data`
+            # alone then silently yields zero items. That's the bug that made cold
+            # replies stop alerting ~2026-07-19. Fall back to `data_preview` so we still
+            # catch the most-recent leads even when the response is offloaded.
+            data = r0.get("data")
+            if not data:
+                data = r0.get("data_preview") or {}
+            return data or {}
         except Exception as e:
             print(f"[ERROR] {tool_slug}: {e} | {json.dumps(res)[:300] if res else 'no response'}")
             return {}
@@ -327,10 +337,14 @@ def poll_instantly(mcp):
     A focused 'received' email = a real prospect reply. Instantly's focused filter
     keeps out the cold spam the sending inboxes also collect."""
     leads = []
+    # Keep limit modest: full email bodies are heavy, so a smaller pull is more likely
+    # to come back inline (full `data`) rather than as an offloaded `data_preview`.
+    # execute() falls back to the preview either way, which is newest-first - fine here.
     data = mcp.execute("INSTANTLY_LIST_EMAILS",
                        {"email_type": "received", "mode": "emode_focused",
-                        "limit": 25, "sort_order": "desc"}, INSTANTLY_ACCOUNT)
-    for msg in data.get("items", []) or []:
+                        "limit": 10, "sort_order": "desc"}, INSTANTLY_ACCOUNT)
+    items = data.get("items", []) or []
+    for msg in items:
         if (parse_ts(msg.get("timestamp_created") or msg.get("timestamp_email")) or OLD) < CUTOFF:
             continue
         email = (msg.get("from_address_email") or "").strip()
@@ -345,6 +359,9 @@ def poll_instantly(mcp):
                 "subject": msg.get("subject", ""), "note": note,
                 "link": "https://app.instantly.ai/app/unibox"}
         leads.append(("Cold-email reply", lead, msg.get("id") or msg.get("message_id")))
+    # Visibility: len(items)==0 here is the offload-bug signature; anything >0 means the
+    # Instantly channel is genuinely being read.
+    print(f"[instantly] {len(items)} received item(s) read, {len(leads)} candidate reply lead(s) in window")
     return leads
 
 
@@ -363,9 +380,14 @@ def selftest(mcp):
                      {"query": "from:crm.wix.com", "label_ids": ["INBOX"], "max_results": 1, "verbose": False},
                      WIX_INBOX)
     checks.append(("Wix form inbox", ("messages" in wx or "nextPageToken" in wx)))
+    # Use the SAME limit as the real poll (10), not 1. limit:1 stays tiny and always
+    # comes back inline, so it masked the offload bug that broke the real limit:25 poll.
+    # Requiring items>0 makes a future offload regression fail the self-test loudly.
     inst = mcp.execute("INSTANTLY_LIST_EMAILS",
-                       {"email_type": "received", "mode": "emode_focused", "limit": 1}, INSTANTLY_ACCOUNT)
-    checks.append(("Instantly unibox (cold replies)", "items" in inst))
+                       {"email_type": "received", "mode": "emode_focused",
+                        "limit": 10, "sort_order": "desc"}, INSTANTLY_ACCOUNT)
+    n_inst = len(inst.get("items", []) or [])
+    checks.append((f"Instantly unibox (cold replies) - read {n_inst} recent", n_inst > 0))
     lines = [f"{'OK  ' if ok else 'FAIL'} {n}" for n, ok in checks]
     all_ok = all(ok for _, ok in checks)
     for ln in lines:

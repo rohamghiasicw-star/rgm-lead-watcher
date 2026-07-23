@@ -16,6 +16,14 @@ on:
         description: "Run connection self-test (sends a Telegram check) instead of the loop"
         type: boolean
         default: false
+      dryrun:
+        description: "One-shot diagnostic: log would-be alerts, send NOTHING to Telegram, don't touch state"
+        type: boolean
+        default: false
+      lookback_min:
+        description: "Dry-run look-back window in minutes (e.g. 7200 = 5 days)"
+        type: string
+        default: "1440"
 
 permissions:
   contents: write
@@ -42,6 +50,12 @@ jobs:
           set +e
           if [ "${{ inputs.selftest }}" = "true" ]; then
             python poller.py --selftest
+            exit $?
+          fi
+          if [ "${{ inputs.dryrun }}" = "true" ]; then
+            # One-shot: reads every channel over a wide window and PRINTS [WOULD ALERT]
+            # lines. Sends nothing to Telegram and never writes state.json.
+            LOOKBACK_MIN="${{ inputs.lookback_min }}" python poller.py --dryrun
             exit $?
           fi
           git config user.name "rgm-lead-watcher"
