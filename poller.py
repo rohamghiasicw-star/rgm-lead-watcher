@@ -341,42 +341,56 @@ def poll_instantly(mcp):
     noreply/mailer-daemon automation, his own sending domains, and his own SaaS
     account notifications (Bouncer/Instantly/ScaledMail)."""
     leads = []
-    # Keep limit modest: full email bodies are heavy, so a smaller pull is more likely
-    # to come back inline (full `data`) rather than as an offloaded `data_preview`.
-    # execute() falls back to the preview either way, which is newest-first - fine here.
-    data = mcp.execute("INSTANTLY_LIST_EMAILS",
-                       {"email_type": "received", "mode": "emode_all",
-                        "limit": 10, "sort_order": "desc"}, INSTANTLY_ACCOUNT)
-    items = data.get("items", []) or []
-    for msg in items:
-        if not isinstance(msg, dict):
-            continue
+    # PAGINATE ONE EMAIL AT A TIME. emode_all pulls in fat-HTML auto-replies whose bodies
+    # push a multi-item response past Composio's large-response threshold; it then offloads
+    # to a sandbox file and returns a TRUNCATED, unreliably-ordered `data_preview` that
+    # silently drops replies (it dropped a real reply in testing). A limit:1 page is always
+    # small enough to come back inline/whole, so we walk the unibox newest->older with the
+    # cursor until we cross the CUTOFF window. Cheap in steady state (0-3 pages/poll).
+    read = 0
+    cursor = None
+    seen_ids = set()
+    for _ in range(30):                       # hard page cap (backstop for a stuck cursor)
+        args = {"email_type": "received", "mode": "emode_all", "limit": 1, "sort_order": "desc"}
+        if cursor:
+            args["starting_after"] = cursor
+        data = mcp.execute("INSTANTLY_LIST_EMAILS", args, INSTANTLY_ACCOUNT)
+        items = data.get("items") or []
+        if not items or not isinstance(items[0], dict):
+            break
+        msg = items[0]
+        mid = msg.get("id") or msg.get("message_id")
+        if mid in seen_ids:                   # cursor didn't advance - stop, don't spin
+            break
+        seen_ids.add(mid)
+        read += 1
+        t = parse_ts(msg.get("timestamp_created") or msg.get("timestamp_email"))
+        if t and t < CUTOFF:                  # reached older-than-window - done paging
+            break
         try:
-            if (parse_ts(msg.get("timestamp_created") or msg.get("timestamp_email")) or OLD) < CUTOFF:
-                continue
             email = (msg.get("from_address_email") or "").strip()
-            if any(x in email.lower() for x in EXCLUDE_SENDERS):
-                continue
-            frm = msg.get("from_address_json") or []
-            first = frm[0] if isinstance(frm, list) and frm and isinstance(frm[0], dict) else {}
-            name = (first.get("name") or "").strip()
-            if not name or "@" in name:
-                name = email.split("@")[0] if email else "(reply)"
-            # `body` is usually {"text","html"} but emode_all's "Others" items sometimes
-            # return it as a bare string - handle both so one odd item can't kill the poll.
-            body = msg.get("body")
-            body_text = body.get("text") if isinstance(body, dict) else (body if isinstance(body, str) else "")
-            note = (msg.get("content_preview") or body_text or "").strip()[:180]
-            lead = {"name": name, "company": "", "city": "", "phone": "", "email": email,
-                    "subject": msg.get("subject", ""), "note": note,
-                    "link": "https://app.instantly.ai/app/unibox"}
-            leads.append(("Cold-email reply", lead, msg.get("id") or msg.get("message_id")))
+            if not any(x in email.lower() for x in EXCLUDE_SENDERS):
+                frm = msg.get("from_address_json") or []
+                first = frm[0] if isinstance(frm, list) and frm and isinstance(frm[0], dict) else {}
+                name = (first.get("name") or "").strip()
+                if not name or "@" in name:
+                    name = email.split("@")[0] if email else "(reply)"
+                # `body` is usually {"text","html"} but some items return it as a bare
+                # string - handle both so one odd item can't break the parse.
+                body = msg.get("body")
+                body_text = body.get("text") if isinstance(body, dict) else (body if isinstance(body, str) else "")
+                note = (msg.get("content_preview") or body_text or "").strip()[:180]
+                lead = {"name": name, "company": "", "city": "", "phone": "", "email": email,
+                        "subject": msg.get("subject", ""), "note": note,
+                        "link": "https://app.instantly.ai/app/unibox"}
+                leads.append(("Cold-email reply", lead, mid))
         except Exception as e:
             print(f"[WARN] instantly item skipped: {e}")
-            continue
-    # Visibility: len(items)==0 here is the offload-bug signature; anything >0 means the
-    # Instantly channel is genuinely being read.
-    print(f"[instantly] {len(items)} received item(s) read, {len(leads)} candidate reply lead(s) in window")
+        cursor = data.get("next_starting_after")
+        if not cursor:
+            break
+    # Visibility: read==0 is the connection/offload-bug signature; >0 means we're reading.
+    print(f"[instantly] paged {read} received item(s), {len(leads)} reply lead(s) in window")
     return leads
 
 
@@ -395,14 +409,13 @@ def selftest(mcp):
                      {"query": "from:crm.wix.com", "label_ids": ["INBOX"], "max_results": 1, "verbose": False},
                      WIX_INBOX)
     checks.append(("Wix form inbox", ("messages" in wx or "nextPageToken" in wx)))
-    # Use the SAME limit as the real poll (10), not 1. limit:1 stays tiny and always
-    # comes back inline, so it masked the offload bug that broke the real limit:25 poll.
-    # Requiring items>0 makes a future offload regression fail the self-test loudly.
+    # Mirror the real poll's per-page call exactly (emode_all, limit 1). Requiring items>0
+    # means the self-test fails loud if the Instantly read ever returns nothing again.
     inst = mcp.execute("INSTANTLY_LIST_EMAILS",
                        {"email_type": "received", "mode": "emode_all",
-                        "limit": 10, "sort_order": "desc"}, INSTANTLY_ACCOUNT)
+                        "limit": 1, "sort_order": "desc"}, INSTANTLY_ACCOUNT)
     n_inst = len(inst.get("items", []) or [])
-    checks.append((f"Instantly unibox (all replies) - read {n_inst} recent", n_inst > 0))
+    checks.append((f"Instantly unibox (all replies) - read {n_inst}", n_inst > 0))
     lines = [f"{'OK  ' if ok else 'FAIL'} {n}" for n, ok in checks]
     all_ok = all(ok for _, ok in checks)
     for ln in lines:
