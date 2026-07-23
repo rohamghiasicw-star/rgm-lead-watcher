@@ -350,22 +350,30 @@ def poll_instantly(mcp):
     read = 0
     cursor = None
     seen_ids = set()
-    for _ in range(30):                       # hard page cap (backstop for a stuck cursor)
+    hit_cap = True
+    # Instantly's API allows 20 requests/min. Steady-state polling only walks the few
+    # emails newer than CUTOFF (0-3 pages), so this cap only bites on a big backlog after
+    # downtime - in which case a 429 makes execute() return {} and we stop cleanly; the
+    # remaining unseen ones get picked up on the next 3-min poll (fresh rate budget).
+    for _ in range(15):                       # page cap, safely under the 20 req/min limit
         args = {"email_type": "received", "mode": "emode_all", "limit": 1, "sort_order": "desc"}
         if cursor:
             args["starting_after"] = cursor
         data = mcp.execute("INSTANTLY_LIST_EMAILS", args, INSTANTLY_ACCOUNT)
         items = data.get("items") or []
         if not items or not isinstance(items[0], dict):
+            hit_cap = False
             break
         msg = items[0]
         mid = msg.get("id") or msg.get("message_id")
         if mid in seen_ids:                   # cursor didn't advance - stop, don't spin
+            hit_cap = False
             break
         seen_ids.add(mid)
         read += 1
         t = parse_ts(msg.get("timestamp_created") or msg.get("timestamp_email"))
         if t and t < CUTOFF:                  # reached older-than-window - done paging
+            hit_cap = False
             break
         try:
             email = (msg.get("from_address_email") or "").strip()
@@ -388,9 +396,14 @@ def poll_instantly(mcp):
             print(f"[WARN] instantly item skipped: {e}")
         cursor = data.get("next_starting_after")
         if not cursor:
+            hit_cap = False
             break
     # Visibility: read==0 is the connection/offload-bug signature; >0 means we're reading.
     print(f"[instantly] paged {read} received item(s), {len(leads)} reply lead(s) in window")
+    if hit_cap:
+        # Stopped at the page cap without reaching the window edge - a backlog remains.
+        # The next 3-min poll continues from the newest (already-alerted ones are in seen).
+        print(f"[instantly] page cap hit with backlog remaining; continues next poll")
     return leads
 
 
