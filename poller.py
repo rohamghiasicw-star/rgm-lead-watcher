@@ -40,6 +40,31 @@ IG_ACCOUNT = "rgm-business"             # @rgm_marketing_
 IG_SELF_USERNAME = "rgm_marketing_"
 WIX_INBOX = "gmail_incog-wur"   # rohamghiasicw@gmail.com - Wix website-form leads land here
 
+# EVERY Composio-connected Gmail inbox, watched for direct human replies (poll_direct).
+# Roham 2026-08-05: "get the lead watcher to watch all composio inboxes connected too."
+# WHY THIS EXISTS: Loom/manual outreach is sent straight from these inboxes, NOT through
+# the Instantly campaign, so those replies never touch the unibox and poll_instantly is
+# blind to them. Bryan Bene (Beyond Auto) and Idrees Hakimi (Proud Cleaners) both replied
+# with buying questions on 2026-08-04/05 and neither fired an alert.
+# Composio caps Gmail at 5 accounts per toolkit; add new ids here as they're connected.
+DIRECT_INBOXES = [
+    ("gmail_nail-trest",  "roham@rghiasi.com"),
+    ("gmail_bilby-stoma", "rg@rghiasi.com"),
+    ("gmail_catch-uncord", "roham@rohamrg.com"),
+    ("gmail_incog-wur",   "rohamghiasicw@gmail.com"),
+]
+
+# Roham's own sending infrastructure. A REAL reply threads onto something he sent, so its
+# In-Reply-To/References points back at one of these. Warmup mail has NO In-Reply-To at
+# all (verified 2026-08-05), which is what makes this filter work.
+OWN_MSGID_MARKERS = ("rghiasi.com", "rohamrg.com", "rohamresults.com",
+                     "rohamresultsrg.com", "rghiasiresults.com", "mail.gmail.com")
+
+# Instantly's warmup network tags every warmup subject with a shared token. Secondary
+# belt-and-braces filter only - the In-Reply-To gate above is the real defence, because
+# this token can rotate.
+WARMUP_SUBJECT_TAGS = ("SXEG9Y4",)
+
 # Cold outreach now sends via Instantly (ScaledMail inboxes -> Instantly). Prospect
 # replies land in the Instantly unibox, NOT in the old per-inbox Gmail accounts (those
 # were disconnected from Composio 2026-07). A focused "received" email = a real reply.
@@ -407,6 +432,68 @@ def poll_instantly(mcp):
     return leads
 
 
+def _headers(msg):
+    ph = (msg.get("payload") or {}).get("headers") or []
+    return {(h.get("name") or "").lower(): (h.get("value") or "") for h in ph if isinstance(h, dict)}
+
+
+def poll_direct(mcp):
+    """Human replies to Roham's DIRECT outreach, across every connected Gmail inbox.
+
+    Loom/manual sends go straight from these inboxes and never enter the Instantly
+    campaign, so poll_instantly can't see the replies. This closes that gap.
+
+    THE HARD PART is that these inboxes are flooded with Instantly warmup mail (10-30/day
+    each). Alerting on all of it would bury the real leads. The filter that works
+    (verified against live data 2026-08-05):
+
+      * a REAL reply threads onto a message Roham sent, so In-Reply-To/References
+        contains one of OWN_MSGID_MARKERS. Bryan + Idrees both matched.
+      * WARMUP mail carries no In-Reply-To at all and self-references its own
+        Message-ID, so it never matches. All 10+ sampled warmup emails were excluded.
+
+    The In-Reply-To gate is the primary defence; the warmup subject tag is a secondary
+    check in case the warmup network ever starts threading properly.
+    """
+    leads = []
+    for account, label in DIRECT_INBOXES:
+        try:
+            listing = mcp.execute("GMAIL_FETCH_EMAILS",
+                                  {"query": f"in:inbox newer_than:{GMAIL_FRESH_H}h",
+                                   "label_ids": ["INBOX"], "max_results": 15,
+                                   "verbose": True}, account)
+        except Exception as e:
+            print(f"[WARN] direct[{label}] fetch failed: {e}")
+            continue
+        msgs = listing.get("messages", []) or []
+        kept = 0
+        for msg in msgs:
+            if not isinstance(msg, dict):
+                continue
+            if (parse_ts(msg.get("messageTimestamp") or msg.get("internalDate")) or OLD) < CUTOFF:
+                continue
+            sender = (msg.get("sender") or "")
+            email = sender.split("<")[-1].rstrip(">").strip().lower() if "<" in sender else sender.strip().lower()
+            if any(x in email for x in EXCLUDE_SENDERS):
+                continue
+            subject = msg.get("subject") or ""
+            if any(tag in subject for tag in WARMUP_SUBJECT_TAGS):
+                continue
+            H = _headers(msg)
+            thread_ref = (H.get("in-reply-to", "") + " " + H.get("references", "")).lower()
+            if not any(dom in thread_ref for dom in OWN_MSGID_MARKERS):
+                continue          # not a reply to anything Roham sent -> not a lead
+            name = sender.split("<")[0].strip().strip('"') or (email.split("@")[0] if email else "(reply)")
+            body = msg.get("messageText") or (msg.get("preview") or {}).get("body") or ""
+            lead = {"name": name, "company": "", "city": "", "phone": "", "email": email,
+                    "subject": subject, "note": body.strip()[:180],
+                    "link": msg.get("display_url", "")}
+            leads.append((f"Direct reply ({label})", lead, msg.get("messageId")))
+            kept += 1
+        print(f"[direct] {label}: scanned {len(msgs)}, {kept} real repl(y/ies) in window")
+    return leads
+
+
 # ----------------------------------------------------------------------------
 # Self-test + main
 # ----------------------------------------------------------------------------
@@ -429,6 +516,14 @@ def selftest(mcp):
                         "limit": 1, "sort_order": "desc"}, INSTANTLY_ACCOUNT)
     n_inst = len(inst.get("items", []) or [])
     checks.append((f"Instantly unibox (all replies) - read {n_inst}", n_inst > 0))
+    # Every connected Gmail inbox must be readable. Reading >0 is the pass condition
+    # (these inboxes always have warmup traffic), so a dead/revoked connection fails loud.
+    for account, label in DIRECT_INBOXES:
+        g = mcp.execute("GMAIL_FETCH_EMAILS",
+                        {"query": "in:inbox", "label_ids": ["INBOX"],
+                         "max_results": 1, "verbose": False}, account)
+        n = len(g.get("messages", []) or [])
+        checks.append((f"Direct inbox {label} - read {n}", n > 0))
     lines = [f"{'OK  ' if ok else 'FAIL'} {n}" for n, ok in checks]
     all_ok = all(ok for _, ok in checks)
     for ln in lines:
@@ -467,7 +562,7 @@ def main():
 
     # All channels are cheap single calls now (Instantly replaced the 6 Gmail inboxes),
     # so every poll runs the full set - replies alert as fast as DMs. --fast is a no-op.
-    fns = [poll_facebook, poll_instagram, poll_wix, poll_meta, poll_instantly]
+    fns = [poll_facebook, poll_instagram, poll_wix, poll_meta, poll_instantly, poll_direct]
 
     print(f"[RUN] {NOW.isoformat()} since={CUTOFF.isoformat()} last_run={state.get('last_run')} seen={len(seen)} fast={'--fast' in sys.argv}")
     leads = []
