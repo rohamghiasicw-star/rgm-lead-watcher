@@ -60,6 +60,19 @@ DIRECT_INBOXES = [
 OWN_MSGID_MARKERS = ("rghiasi.com", "rohamrg.com", "rohamresults.com",
                      "rohamresultsrg.com", "rghiasiresults.com", "mail.gmail.com")
 
+# Header-independent fallback. The first production dryrun returned 0 from every inbox
+# even though the same filter found 2 locally, because payload.headers does not reliably
+# come back over the MCP path - so an In-Reply-To-only gate silently rejects everything.
+# A real reply also QUOTES the original ("On <date> Roham Ghiasi <roham@rghiasi.com>
+# wrote:"), so his own address appears in the body. Warmup templates never contain it.
+# Verified 2026-08-05: header and body signals agreed on both real replies, 0/58 warmup
+# emails matched either.
+OWN_ADDRESSES = ("roham@rghiasi.com", "rg@rghiasi.com",
+                 "roham@rohamrg.com", "rghiasi@rohamrg.com",
+                 "rohamghiasi@rohamresults.com", "rghiasi@rohamresults.com",
+                 "rohamghiasi@rohamresultsrg.com", "rghiasi@rohamresultsrg.com",
+                 "rohamghiasi@rghiasiresults.com", "roham@rghiasiresults.com")
+
 # Instantly's warmup network tags every warmup subject with a shared token. Secondary
 # belt-and-braces filter only - the In-Reply-To gate above is the real defence, because
 # this token can rotate.
@@ -479,12 +492,14 @@ def poll_direct(mcp):
             subject = msg.get("subject") or ""
             if any(tag in subject for tag in WARMUP_SUBJECT_TAGS):
                 continue
+            body = msg.get("messageText") or (msg.get("preview") or {}).get("body") or ""
             H = _headers(msg)
             thread_ref = (H.get("in-reply-to", "") + " " + H.get("references", "")).lower()
-            if not any(dom in thread_ref for dom in OWN_MSGID_MARKERS):
+            by_header = any(dom in thread_ref for dom in OWN_MSGID_MARKERS)
+            by_quote = any(a in body.lower() for a in OWN_ADDRESSES)
+            if not (by_header or by_quote):
                 continue          # not a reply to anything Roham sent -> not a lead
             name = sender.split("<")[0].strip().strip('"') or (email.split("@")[0] if email else "(reply)")
-            body = msg.get("messageText") or (msg.get("preview") or {}).get("body") or ""
             lead = {"name": name, "company": "", "city": "", "phone": "", "email": email,
                     "subject": subject, "note": body.strip()[:180],
                     "link": msg.get("display_url", "")}
