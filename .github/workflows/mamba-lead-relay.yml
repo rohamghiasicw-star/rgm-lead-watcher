@@ -13,6 +13,10 @@ on:
         description: "List pending leads without sending or marking"
         required: false
         default: "false"
+      test_to:
+        description: "Redirect the relay email to this address instead of the client"
+        required: false
+        default: ""
 
 concurrency:
   group: mamba-lead-relay
@@ -32,4 +36,5 @@ jobs:
           COMPOSIO_CONSUMER_KEY: ${{ secrets.COMPOSIO_CONSUMER_KEY }}
           MAMBA_WP_APP_PASS: ${{ secrets.MAMBA_WP_APP_PASS }}
           MAMBA_DRY_RUN: ${{ github.event.inputs.dryrun == 'true' && '1' || '' }}
+          MAMBA_TEST_TO: ${{ github.event.inputs.test_to }}
         run: python3 mamba_relay.py

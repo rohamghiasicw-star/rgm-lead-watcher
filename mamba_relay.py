@@ -19,6 +19,8 @@ ENV
   COMPOSIO_CONSUMER_KEY  - required (ck_...), already a repo secret
   MAMBA_WP_APP_PASS      - required, WordPress application password
   MAMBA_DRY_RUN          - optional, "1" = do not send or mark
+  MAMBA_TEST_TO          - optional, redirect the email here instead of the
+                           client (for end-to-end testing without spamming them)
 """
 import base64, json, os, re, sys, urllib.request, urllib.error
 import html as htmlmod
@@ -34,7 +36,7 @@ UA      = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
            "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36")
 
 GMAIL_ACCOUNT = "gmail_nail-trest"          # roham@rghiasi.com
-CLIENT_EMAIL  = "info@mambadrainageservices.com"
+CLIENT_EMAIL  = os.environ.get("MAMBA_TEST_TO", "").strip() or "info@mambadrainageservices.com"
 
 
 class MCP:
@@ -181,6 +183,10 @@ def main():
         }, account=GMAIL_ACCOUNT)
 
         if res.get("id") or res.get("threadId"):
+            if os.environ.get("MAMBA_TEST_TO", "").strip():
+                print(f"[test] id={ld['id']} relayed to test address, NOT marked")
+                sent += 1
+                continue
             if mark(ld["id"]):
                 sent += 1
                 print(f"[sent] id={ld['id']} relayed and marked")
