@@ -1,0 +1,35 @@
+name: Mamba Lead Relay
+
+# The Mamba website cannot deliver its own lead emails (no SPF/DKIM, blocklisted
+# sending IP), so this relays new leads to the client from an authenticated
+# Gmail account via Composio. Runs in the cloud so it does not depend on a laptop.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      dryrun:
+        description: "List pending leads without sending or marking"
+        required: false
+        default: "false"
+
+concurrency:
+  group: mamba-lead-relay
+  cancel-in-progress: false
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Relay new Mamba leads
+        env:
+          COMPOSIO_CONSUMER_KEY: ${{ secrets.COMPOSIO_CONSUMER_KEY }}
+          MAMBA_WP_APP_PASS: ${{ secrets.MAMBA_WP_APP_PASS }}
+          MAMBA_DRY_RUN: ${{ github.event.inputs.dryrun == 'true' && '1' || '' }}
+        run: python3 mamba_relay.py
