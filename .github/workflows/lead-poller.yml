@@ -67,8 +67,10 @@ jobs:
             # speed-critical channels every ~3 min; full sweep (incl. 6 cold inboxes) every ~15 min
             if [ $(( i % 5 )) -eq 0 ]; then python poller.py || true; else python poller.py --fast || true; fi
             # persist state ~every 15 min so a restart resumes without re-alerting
-            if [ $(( i % 5 )) -eq 0 ] && [ -n "$(git status --porcelain state.json)" ]; then
-              git add state.json
+            if [ $(( i % 5 )) -eq 0 ] && [ -n "$(git status --porcelain state.json leads.jsonl)" ]; then
+              # leads.jsonl rides along with state.json so every lead is committed
+              # back to the repo. A Telegram ping is a notification, not a record.
+              git add state.json leads.jsonl
               git commit -m "state [skip ci]" >/dev/null 2>&1
               git pull --rebase --autostash >/dev/null 2>&1
               git push >/dev/null 2>&1 || true

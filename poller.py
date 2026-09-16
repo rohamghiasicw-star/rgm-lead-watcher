@@ -10,6 +10,8 @@ Lead sources:
   - Facebook Messenger (RGM page)  - lead-form DMs
   - Instagram DMs (@rgm_marketing_) - lead-form DMs
   - Wix website contact form -> no-reply@crm.wix.com -> rohamghiasicw@gmail.com
+  - rgresults.ca free-analysis form -> formsubmit.co relay -> rohamghiasicw@gmail.com
+Every lead is also appended to leads.jsonl, committed back to this repo.
   - Cold-outreach replies -> Instantly unibox (ScaledMail inboxes -> Instantly)
 
 Reuses the Composio connections via the MCP endpoint + your CONSUMER key (ck_...).
@@ -106,6 +108,27 @@ def load_state():
             return json.load(f)
     except Exception:
         return {}
+
+
+LEADS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leads.jsonl")
+
+
+def save_lead(source, lead, did):
+    """Append every lead to leads.jsonl, one JSON object per line.
+
+    A Telegram ping is a notification, not a record: scroll past it and the lead is
+    gone. The email survives in Gmail but is not a list you can read down. This file
+    is committed back to the repo by the workflow alongside state.json, so there is a
+    permanent, timestamped, ordered record of every lead that ever came in, readable
+    on GitHub and greppable locally. Append-only and best-effort: a failure here must
+    never stop the Telegram alert, which is the time-critical half."""
+    try:
+        row = {"at": NOW.isoformat(), "source": source, "msg_id": did}
+        row.update({k: v for k, v in lead.items() if v})
+        with open(LEADS_FILE, "a") as f:
+            f.write(json.dumps(row, sort_keys=True) + "\n")
+    except Exception as e:
+        print(f"[WARN] could not append to leads.jsonl: {e}")
 
 
 def save_state(state):
@@ -351,6 +374,81 @@ def poll_wix(mcp):
     return leads
 
 
+# --- rgresults.ca intake form (FormSubmit relay) -----------------------------
+# The Wix site was replaced on 2026-09-16. rgresults.ca runs on GitHub Pages now and
+# its free-analysis form POSTs JSON to https://formsubmit.co/ajax/rohamghiasicw@gmail.com,
+# which relays it here as an email. poll_wix only queries from:crm.wix.com, so without
+# this every lead off the new site would land in the inbox and never reach Telegram,
+# and nothing would error - the run would just keep printing "No new leads".
+
+SITE_LABELS = {"fullname": "name", "full name": "name", "name": "name",
+               "email": "email", "bemail": "email", "business email": "email",
+               "phone": "phone", "code": "code",
+               "biz": "company", "company": "company", "business": "company",
+               "website": "website", "site": "website",
+               "gmaps": "gmaps", "google maps": "gmaps",
+               "timing": "timing", "wants it solved": "timing"}
+
+_SITE_STOPS = "|".join(sorted((re.escape(k) for k in SITE_LABELS), key=len, reverse=True))
+
+
+def parse_site_form(text):
+    """Parse a FormSubmit relay of the rgresults.ca free-analysis form.
+
+    FormSubmit renders the posted JSON as 'label: value', but Gmail's inline snippet
+    flattens it onto one line, so each value is read up to the NEXT known label rather
+    than to a newline."""
+    if not text:
+        return None
+
+    def grab(*labels):
+        """An empty field is normal - the form only requires some of them. So the value
+        is allowed to be empty and is then cut at the next 'label:', because otherwise
+        'fullname:  email: x@y.com' returns the email address as the NAME."""
+        for lab in labels:
+            m = re.search(re.escape(lab) + r"\s*:?\s*(.*?)(?=\s*(?:" + _SITE_STOPS + r")\s*:|$)",
+                          text, re.I)
+            if not m:
+                continue
+            val = re.split(r"\s*(?:" + _SITE_STOPS + r")\s*:", m.group(1), 1, re.I)[0].strip()
+            if val:
+                return val
+        return ""
+
+    email = grab("email", "bemail", "business email")
+    em = re.search(r"[\w.+-]+@[\w.-]+\.\w+", email or text)
+    email = em.group(0) if em else ""
+    name = grab("fullname", "full name", "name")
+    phone = " ".join(x for x in [grab("code"), grab("phone")] if x).strip()
+    company = grab("biz", "company", "business")
+    website = grab("website", "site")
+    timing = grab("timing", "wants it solved")
+    if not (name or email or phone):
+        return None
+    note = " - ".join(x for x in [website, ("wants it solved: " + timing) if timing else ""] if x)
+    return {"name": name or "(no name)", "company": company, "city": "",
+            "phone": phone, "email": email, "note": note}
+
+
+def poll_site_form(mcp):
+    """rgresults.ca free-analysis form, relayed by FormSubmit into the same inbox."""
+    leads = []
+    listing = mcp.execute("GMAIL_FETCH_EMAILS",
+                          {"query": f"from:formsubmit.co newer_than:{GMAIL_FRESH_H}h",
+                           "label_ids": ["INBOX"], "max_results": 15, "verbose": True}, WIX_INBOX)
+    for msg in listing.get("messages", []) or []:
+        if (parse_ts(msg.get("messageTimestamp") or msg.get("internalDate")) or OLD) < CUTOFF:
+            continue
+        body = (msg.get("preview") or {}).get("body") or msg.get("messageText", "")
+        if "activate" in (msg.get("subject", "") + body).lower():
+            continue                      # FormSubmit's own activation handshake
+        lead = parse_site_form(body)
+        if lead:
+            lead["link"] = msg.get("display_url", "")
+            leads.append(("rgresults.ca form", lead, msg.get("messageId")))
+    return leads
+
+
 def poll_meta(mcp):
     """Facebook Lead Ads: Meta emails 'N new lead(s) available for RGM' (no contact in the
     email - it lives in Meta Lead Center, so we notify + link to it)."""
@@ -577,7 +675,7 @@ def main():
 
     # All channels are cheap single calls now (Instantly replaced the 6 Gmail inboxes),
     # so every poll runs the full set - replies alert as fast as DMs. --fast is a no-op.
-    fns = [poll_facebook, poll_instagram, poll_wix, poll_meta, poll_instantly, poll_direct]
+    fns = [poll_facebook, poll_instagram, poll_wix, poll_site_form, poll_meta, poll_instantly, poll_direct]
 
     print(f"[RUN] {NOW.isoformat()} since={CUTOFF.isoformat()} last_run={state.get('last_run')} seen={len(seen)} fast={'--fast' in sys.argv}")
     leads = []
@@ -593,6 +691,8 @@ def main():
         if key in seen:
             continue
         send_telegram(mcp, source, lead)
+        if not DRY_RUN:
+            save_lead(source, lead, did)
         seen[key] = NOW.isoformat()
         new += 1
     print(f"[DONE] {new} new lead(s) sent." if new else "[DONE] No new leads.")

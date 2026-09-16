@@ -52,3 +52,28 @@ Composio, so the only secret it needs is your Composio API key.
   Change the lookback window with a `LOOKBACK_MIN` secret/variable.
 - If a run errors, open the failed run in the **Actions** tab — the log prints the
   exact Composio response. Paste it back and it's a quick fix (usually an account ID).
+
+## Change log
+
+### 2026-09-16 - new-site leads would have reached nobody, and leads were never kept
+**What broke:** the Wix site was replaced by rgresults.ca on GitHub Pages. Its
+free-analysis form POSTs to `https://formsubmit.co/ajax/rohamghiasicw@gmail.com`, the
+same inbox but a different sender. `poll_wix` only queries `from:crm.wix.com`, so every
+lead off the new site would have sat unread while the run kept printing "No new leads".
+Nothing would have errored.
+
+**What I changed:**
+- `parse_site_form()` + `poll_site_form()` querying `from:formsubmit.co`, registered in
+  `fns`. Kept separate from `poll_wix`: the two email bodies share no format, and Wix
+  notifications already in the inbox still have to parse.
+- `save_lead()` appends every lead to `leads.jsonl`, and the workflow now commits it
+  alongside `state.json`. A Telegram ping is a notification, not a record - scroll past
+  it and the lead is gone. This is the permanent list.
+
+**Two gotchas worth keeping:**
+1. FormSubmit answers **HTTP 200** with `{"success":"false"}` until the address is
+   activated. The site's form handler checks the response BODY, not just `r.ok`, or it
+   would show visitors "we have it" while nothing was delivered.
+2. FormSubmit flattens the posted JSON onto one line in the Gmail snippet, so values are
+   read up to the NEXT known label rather than to a newline. The first version let an
+   empty field swallow the following label and reported the email address as the name.
