@@ -510,18 +510,38 @@ def poll_calendly(mcp):
     skipped explicitly rather than by accident, so if that is ever wanted it is a
     one-line change here and not a rediscovery.
     """
+    # EVERY connected inbox, not just WIX_INBOX. Calendly notifies whichever address
+    # the Calendly ACCOUNT uses, which is not necessarily the one the website forms
+    # relay into. A 180 day dry run found zero Calendly mail in rohamghiasicw@gmail
+    # alone, so pinning this to one inbox is exactly how a booked call would go
+    # unnoticed forever while the code looked fine. Cost is 4 cheap calls a poll.
     leads = []
-    listing = mcp.execute("GMAIL_FETCH_EMAILS",
-                          {"query": f"from:calendly.com newer_than:{GMAIL_FRESH_H}h",
-                           "label_ids": ["INBOX"], "max_results": 15, "verbose": True}, WIX_INBOX)
-    for msg in listing.get("messages", []) or []:
+    seen_ids = set()
+    msgs = []
+    for conn, addr in DIRECT_INBOXES:
+        try:
+            listing = mcp.execute("GMAIL_FETCH_EMAILS",
+                                  {"query": f"from:calendly.com newer_than:{GMAIL_FRESH_H}h",
+                                   "label_ids": ["INBOX"], "max_results": 15, "verbose": True}, conn)
+        except Exception as e:
+            print(f"[WARN] poll_calendly {addr}: {e}")
+            continue
+        for m in listing.get("messages", []) or []:
+            mid = m.get("messageId")
+            if mid and mid in seen_ids:
+                continue
+            if mid:
+                seen_ids.add(mid)
+            m["_inbox"] = addr
+            msgs.append(m)
+    for msg in msgs:
         if (parse_ts(msg.get("messageTimestamp") or msg.get("internalDate")) or OLD) < CUTOFF:
             continue
         subject = msg.get("subject", "") or ""
         body = (msg.get("preview") or {}).get("body") or msg.get("messageText", "")
         low = subject.lower()
         if DRY_RUN:
-            print(f"[CALENDLY RAW] subject={subject!r}")
+            print(f"[CALENDLY RAW] inbox={msg.get('_inbox')} subject={subject!r}")
             print(f"[CALENDLY RAW] body[:600]={(body or '')[:600]!r}")
         if any(w in low for w in ("cancel", "reschedul", "reminder", "invitation to", "survey")):
             continue
