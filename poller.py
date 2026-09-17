@@ -526,6 +526,21 @@ def poll_calendly(mcp):
         except Exception as e:
             print(f"[WARN] poll_calendly {addr}: {e}")
             continue
+        if DRY_RUN:
+            # Per-inbox proof of life. An empty result and a dead connection look
+            # identical from the outside, which is how a silently broken channel
+            # survives. This says which it is.
+            n = len(listing.get("messages", []) or [])
+            print(f"[CAL PROBE] {addr:<26} conn={conn:<20} from:calendly.com -> {n}")
+            try:
+                any_mail = mcp.execute("GMAIL_FETCH_EMAILS",
+                                       {"query": "newer_than:2d", "label_ids": ["INBOX"],
+                                        "max_results": 3, "verbose": True}, conn)
+                am = any_mail.get("messages", []) or []
+                print(f"[CAL PROBE] {addr:<26} ANY mail in 2d -> {len(am)}"
+                      + ("" if not am else f" e.g. {str(am[0].get('subject'))[:70]!r}"))
+            except Exception as e:
+                print(f"[CAL PROBE] {addr:<26} ANY mail query FAILED: {e}")
         for m in listing.get("messages", []) or []:
             mid = m.get("messageId")
             if mid and mid in seen_ids:
