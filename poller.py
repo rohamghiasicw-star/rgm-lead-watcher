@@ -317,6 +317,27 @@ def send_telegram(mcp, source, lead):
 OLD = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
 
 
+def gmail_messages(listing):
+    """Every message list Gmail hands back, with the junk filtered out.
+
+    WHY THIS EXISTS: for at least one connected inbox the API returns `messages`
+    as a list of bare id STRINGS instead of objects. Calling .get() on those
+    raised "'str' object has no attribute 'get'", and because that happened
+    inside a poller, the exception aborted the WHOLE poller. poll_calendly had
+    already collected a real booking from another inbox and threw it away on the
+    way out, alerting nobody and logging one cryptic line. poll_meta has been
+    dying the same way on every run, which is why Facebook lead alerts stopped.
+
+    Silently skipping a malformed entry is right here: one odd row must never
+    cost the leads that were parsed correctly beside it.
+    """
+    out = []
+    for m in (listing or {}).get("messages", []) or []:
+        if isinstance(m, dict):
+            out.append(m)
+    return out
+
+
 def poll_facebook(mcp):
     leads = []
     data = mcp.execute("FACEBOOK_GET_PAGE_CONVERSATIONS",
@@ -363,7 +384,7 @@ def poll_wix(mcp):
     listing = mcp.execute("GMAIL_FETCH_EMAILS",
                           {"query": f"from:crm.wix.com newer_than:{GMAIL_FRESH_H}h",
                            "label_ids": ["INBOX"], "max_results": 15, "verbose": True}, WIX_INBOX)
-    for msg in listing.get("messages", []) or []:
+    for msg in gmail_messages(listing):
         if (parse_ts(msg.get("messageTimestamp") or msg.get("internalDate")) or OLD) < CUTOFF:
             continue
         snippet = (msg.get("preview") or {}).get("body") or msg.get("messageText", "")
@@ -436,7 +457,7 @@ def poll_site_form(mcp):
     listing = mcp.execute("GMAIL_FETCH_EMAILS",
                           {"query": f"from:formsubmit.co newer_than:{GMAIL_FRESH_H}h",
                            "label_ids": ["INBOX"], "max_results": 15, "verbose": True}, WIX_INBOX)
-    for msg in listing.get("messages", []) or []:
+    for msg in gmail_messages(listing):
         if (parse_ts(msg.get("messageTimestamp") or msg.get("internalDate")) or OLD) < CUTOFF:
             continue
         body = (msg.get("preview") or {}).get("body") or msg.get("messageText", "")
@@ -530,18 +551,18 @@ def poll_calendly(mcp):
             # Per-inbox proof of life. An empty result and a dead connection look
             # identical from the outside, which is how a silently broken channel
             # survives. This says which it is.
-            n = len(listing.get("messages", []) or [])
+            n = len(gmail_messages(listing))
             print(f"[CAL PROBE] {addr:<26} conn={conn:<20} from:calendly.com -> {n}")
             try:
                 any_mail = mcp.execute("GMAIL_FETCH_EMAILS",
                                        {"query": "newer_than:2d", "label_ids": ["INBOX"],
                                         "max_results": 3, "verbose": True}, conn)
-                am = any_mail.get("messages", []) or []
+                am = gmail_messages(any_mail)
                 print(f"[CAL PROBE] {addr:<26} ANY mail in 2d -> {len(am)}"
                       + ("" if not am else f" e.g. {str(am[0].get('subject'))[:70]!r}"))
             except Exception as e:
                 print(f"[CAL PROBE] {addr:<26} ANY mail query FAILED: {e}")
-        for m in listing.get("messages", []) or []:
+        for m in gmail_messages(listing):
             mid = m.get("messageId")
             if mid and mid in seen_ids:
                 continue
@@ -579,7 +600,7 @@ def poll_meta(mcp):
     listing = mcp.execute("GMAIL_FETCH_EMAILS",
                           {"query": f"from:business.facebook.com subject:lead newer_than:{GMAIL_FRESH_H}h",
                            "label_ids": ["INBOX"], "max_results": 15, "verbose": True}, WIX_INBOX)
-    for msg in listing.get("messages", []) or []:
+    for msg in gmail_messages(listing):
         if (parse_ts(msg.get("messageTimestamp") or msg.get("internalDate")) or OLD) < CUTOFF:
             continue
         subj = msg.get("subject", "")
@@ -699,11 +720,9 @@ def poll_direct(mcp):
         except Exception as e:
             print(f"[WARN] direct[{label}] fetch failed: {e}")
             continue
-        msgs = listing.get("messages", []) or []
+        msgs = gmail_messages(listing)
         kept = 0
         for msg in msgs:
-            if not isinstance(msg, dict):
-                continue
             if (parse_ts(msg.get("messageTimestamp") or msg.get("internalDate")) or OLD) < CUTOFF:
                 continue
             sender = (msg.get("sender") or "")
