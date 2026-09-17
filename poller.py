@@ -449,6 +449,89 @@ def poll_site_form(mcp):
     return leads
 
 
+_CAL_STOPS = (r"event type|event name|invitee|invitee email|invitee time zone|event date"
+              r"|event date/time|location|questions|phone|phone number|company website"
+              r"|website|description|cancel|reschedule|powered by")
+
+
+def parse_calendly(subject, text):
+    """Calendly's host notification for a NEW booking.
+
+    Deliberately tolerant. Calendly's body layout differs between locales, event
+    types and whether custom questions were answered, so this never depends on a
+    single exact label. The invitee name falls back to the subject line, which is
+    the one field Calendly always puts there: "New Event: <Name> - <when> - <event>".
+    """
+    text = text or ""
+
+    def grab(*labels):
+        for lab in labels:
+            m = re.search(re.escape(lab) + r"\s*:?\s*(.*?)(?=\s*(?:" + _CAL_STOPS + r")\s*:|$)",
+                          text, re.I)
+            if not m:
+                continue
+            val = re.split(r"\s*(?:" + _CAL_STOPS + r")\s*:", m.group(1), 1, re.I)[0].strip()
+            if val:
+                return val
+        return ""
+
+    email = grab("invitee email", "email")
+    em = re.search(r"[\w.+-]+@[\w.-]+\.\w+", email or text)
+    email = em.group(0) if em else ""
+    # Calendly's own addresses are not the lead.
+    if email.lower().endswith("calendly.com"):
+        email = ""
+
+    name = grab("invitee name", "invitee", "name")
+    if not name:
+        m = re.search(r"(?:new event|event scheduled)\s*:\s*([^\-\u2013]+)", subject or "", re.I)
+        name = m.group(1).strip() if m else ""
+
+    phone = grab("phone number", "phone", "mobile")
+    website = grab("company website", "website", "site", "url")
+    when = grab("event date/time", "event date", "date / time", "when")
+    etype = grab("event type", "event name")
+    if not etype and subject:
+        parts = [x.strip() for x in re.split(r"\s+[\-\u2013]\s+", subject)]
+        etype = parts[-1] if len(parts) > 2 else ""
+
+    if not (name or email or phone):
+        return None
+    note = " - ".join(x for x in [etype, when, website] if x)
+    return {"name": name or "(no name)", "company": "", "city": "",
+            "phone": phone, "email": email, "note": note}
+
+
+def poll_calendly(mcp):
+    """Booked calls. Calendly emails the host on every new booking.
+
+    NEW BOOKINGS ONLY. Cancellations and reschedules come from the same sender and
+    would otherwise fire an alert that reads exactly like a fresh lead. They are
+    skipped explicitly rather than by accident, so if that is ever wanted it is a
+    one-line change here and not a rediscovery.
+    """
+    leads = []
+    listing = mcp.execute("GMAIL_FETCH_EMAILS",
+                          {"query": f"from:calendly.com newer_than:{GMAIL_FRESH_H}h",
+                           "label_ids": ["INBOX"], "max_results": 15, "verbose": True}, WIX_INBOX)
+    for msg in listing.get("messages", []) or []:
+        if (parse_ts(msg.get("messageTimestamp") or msg.get("internalDate")) or OLD) < CUTOFF:
+            continue
+        subject = msg.get("subject", "") or ""
+        body = (msg.get("preview") or {}).get("body") or msg.get("messageText", "")
+        low = subject.lower()
+        if DRY_RUN:
+            print(f"[CALENDLY RAW] subject={subject!r}")
+            print(f"[CALENDLY RAW] body[:600]={(body or '')[:600]!r}")
+        if any(w in low for w in ("cancel", "reschedul", "reminder", "invitation to", "survey")):
+            continue
+        lead = parse_calendly(subject, body)
+        if lead:
+            lead["link"] = msg.get("display_url", "")
+            leads.append(("Calendly booking", lead, msg.get("messageId")))
+    return leads
+
+
 def poll_meta(mcp):
     """Facebook Lead Ads: Meta emails 'N new lead(s) available for RGM' (no contact in the
     email - it lives in Meta Lead Center, so we notify + link to it)."""
@@ -675,7 +758,7 @@ def main():
 
     # All channels are cheap single calls now (Instantly replaced the 6 Gmail inboxes),
     # so every poll runs the full set - replies alert as fast as DMs. --fast is a no-op.
-    fns = [poll_facebook, poll_instagram, poll_wix, poll_site_form, poll_meta, poll_instantly, poll_direct]
+    fns = [poll_facebook, poll_instagram, poll_wix, poll_site_form, poll_calendly, poll_meta, poll_instantly, poll_direct]
 
     print(f"[RUN] {NOW.isoformat()} since={CUTOFF.isoformat()} last_run={state.get('last_run')} seen={len(seen)} fast={'--fast' in sys.argv}")
     leads = []
