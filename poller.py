@@ -477,6 +477,22 @@ _CAL_STOPS = (r"event type|event name|invitee|invitee email|invitee time zone|ev
               r"|website|description|cancel|reschedule|powered by")
 
 
+def html_to_text(v):
+    """The full message comes back as raw HTML. Labels and their values sit in
+    separate tags, so a regex looking for 'Invitee Email:' followed by a value
+    matches nothing until the markup is gone."""
+    if not v or "<" not in v:
+        return v or ""
+    v = re.sub(r"(?is)<(script|style|head)[^>]*>.*?</\1>", " ", v)
+    v = re.sub(r"(?i)<br\s*/?>|</(p|div|tr|td|table|h[1-6]|li)>", " \n ", v)
+    v = re.sub(r"(?s)<!--.*?-->", " ", v)
+    v = re.sub(r"<[^>]+>", " ", v)
+    v = (v.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<")
+          .replace("&gt;", ">").replace("&quot;", '"').replace("&#39;", "'")
+          .replace("&zwnj;", "").replace("&#8203;", ""))
+    return re.sub(r"[ \t\r\f\v]+", " ", v).strip()
+
+
 def parse_calendly(subject, text):
     """Calendly's host notification for a NEW booking.
 
@@ -485,7 +501,7 @@ def parse_calendly(subject, text):
     single exact label. The invitee name falls back to the subject line, which is
     the one field Calendly always puts there: "New Event: <Name> - <when> - <event>".
     """
-    text = text or ""
+    text = html_to_text(text)
 
     def grab(*labels):
         for lab in labels:
