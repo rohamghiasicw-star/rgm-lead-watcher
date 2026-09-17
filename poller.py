@@ -550,7 +550,12 @@ def poll_calendly(mcp):
             m["_inbox"] = addr
             msgs.append(m)
     for msg in msgs:
-        if (parse_ts(msg.get("messageTimestamp") or msg.get("internalDate")) or OLD) < CUTOFF:
+        raw_ts = msg.get("messageTimestamp") or msg.get("internalDate")
+        ts = parse_ts(raw_ts)
+        if DRY_RUN:
+            print(f"[CAL TS] raw={raw_ts!r} parsed={ts} cutoff={CUTOFF} "
+                  f"keep={bool(ts and ts >= CUTOFF)} subj={str(msg.get('subject'))[:60]!r}")
+        if (ts or OLD) < CUTOFF:
             continue
         subject = msg.get("subject", "") or ""
         body = (msg.get("preview") or {}).get("body") or msg.get("messageText", "")
