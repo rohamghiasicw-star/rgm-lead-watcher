@@ -600,8 +600,12 @@ def poll_calendly(mcp):
         body = (msg.get("preview") or {}).get("body") or msg.get("messageText", "")
         low = subject.lower()
         if DRY_RUN:
+            pv = (msg.get("preview") or {}).get("body") or ""
+            mt = msg.get("messageText", "") or ""
             print(f"[CALENDLY RAW] inbox={msg.get('_inbox')} subject={subject!r}")
-            print(f"[CALENDLY RAW] body[:600]={(body or '')[:600]!r}")
+            print(f"[CALENDLY RAW] fields: preview.body={len(pv)}ch messageText={len(mt)}ch "
+                  f"keys={sorted(k for k in msg.keys())[:14]}")
+            print(f"[CALENDLY RAW] used body[:1400]={(body or '')[:1400]!r}")
         if any(w in low for w in ("cancel", "reschedul", "reminder", "invitation to", "survey")):
             continue
         lead = parse_calendly(subject, body)
