@@ -470,6 +470,8 @@ def poll_site_form(mcp):
     return leads
 
 
+CAL_CONN = {addr: conn for conn, addr in DIRECT_INBOXES}
+
 _CAL_STOPS = (r"event type|event name|invitee|invitee email|invitee time zone|event date"
               r"|event date/time|location|questions|phone|phone number|company website"
               r"|website|description|cancel|reschedule|powered by")
@@ -599,6 +601,30 @@ def poll_calendly(mcp):
         subject = msg.get("subject", "") or ""
         body = (msg.get("preview") or {}).get("body") or msg.get("messageText", "")
         low = subject.lower()
+
+        # GMAIL_FETCH_EMAILS hands back roughly 200 characters of body, and Calendly
+        # opens a booking mail with Notetaker boilerplate, so the invitee's email and
+        # phone fall past the cutoff and are simply absent from the text. No parser
+        # can recover what was never fetched. Pull the real message for the few
+        # Calendly mails per poll that matter.
+        if len(body) < 600 and msg.get("messageId"):
+            for slug in ("GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID", "GMAIL_GET_MESSAGE"):
+                try:
+                    full = mcp.execute(slug, {"message_id": msg["messageId"],
+                                              "user_id": "me", "format": "full"},
+                                       CAL_CONN.get(msg.get("_inbox")) or WIX_INBOX)
+                except Exception:
+                    continue
+                cand = ""
+                if isinstance(full, dict):
+                    cand = (full.get("messageText")
+                            or (full.get("preview") or {}).get("body")
+                            or full.get("body") or "")
+                if len(cand or "") > len(body):
+                    body = cand
+                    if DRY_RUN:
+                        print(f"[CAL FULL] {slug} gave {len(body)}ch")
+                    break
         if DRY_RUN:
             pv = (msg.get("preview") or {}).get("body") or ""
             mt = msg.get("messageText", "") or ""
