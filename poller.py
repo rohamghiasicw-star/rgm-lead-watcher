@@ -306,6 +306,7 @@ def send_telegram(mcp, source, lead):
         parts.append("Open email (full details/phone): " + lead["link"])
     if DRY_RUN:
         print(f"[WOULD ALERT] {source}: {who} | {lead.get('phone','')} | {lead.get('email','')}")
+        print("[WOULD SEND] " + " || ".join(parts))
         return
     mcp.execute("TELEGRAM_SEND_MESSAGE", {"chat_id": TELEGRAM_CHAT_ID, "text": "\n".join(parts)})
     print(f"[SENT] {source}: {who}")
@@ -538,6 +539,15 @@ def parse_calendly(subject, text):
     website = grab("company website", "website", "site", "url")
     when = grab("event date/time", "event date", "date / time", "when")
     etype = grab("event type", "event name")
+    # Composio truncates a large message body to ~200 chars, so on the booking mail
+    # the labelled fields are often simply absent. The SUBJECT always carries
+    # "New Event: <name> - <when> - <event type>", so fall back to it rather than
+    # send an alert that says only a name.
+    if (not when or not etype) and subject:
+        sp = [x.strip() for x in re.split(r"\s+[\-\u2013]\s+", re.sub(r"(?i)^new event\s*:\s*", "", subject))]
+        if len(sp) >= 3:
+            when = when or sp[-2]
+            etype = etype or sp[-1]
     if not etype and subject:
         parts = [x.strip() for x in re.split(r"\s+[\-\u2013]\s+", subject)]
         etype = parts[-1] if len(parts) > 2 else ""
@@ -554,7 +564,10 @@ def parse_calendly(subject, text):
                      r"unsubscribe|manage notetaker|view (?:event|invitee))\b", v)[0]
         return v.strip(" .,-|")[:90]
 
-    note = " - ".join(x for x in [tidy(etype), tidy(when), tidy(website)] if x)
+    bits = [tidy(etype), tidy(when), tidy(website)]
+    if not email and not phone:
+        bits.append("contact details are in the email, tap below")
+    note = " - ".join(x for x in bits if x)
     return {"name": name or "(no name)", "company": "", "city": "",
             "phone": phone, "email": email, "note": note}
 
