@@ -496,12 +496,17 @@ def parse_calendly(subject, text):
                 return val
         return ""
 
-    email = grab("invitee email", "email")
-    em = re.search(r"[\w.+-]+@[\w.-]+\.\w+", email or text)
-    email = em.group(0) if em else ""
-    # Calendly's own addresses are not the lead.
-    if email.lower().endswith("calendly.com"):
-        email = ""
+    # Take EVERY address in the mail and drop Calendly's own, rather than trusting
+    # one label. The body is boilerplate-heavy ("Your Calendly Notetaker will join
+    # this meeting...") so a single failed label match otherwise falls back to
+    # whatever address appears first, which is Calendly's, and then gets blanked.
+    email = ""
+    for cand in re.findall(r"[\w.+-]+@[\w.-]+\.\w+", (grab("invitee email", "email") or "") + " " + text):
+        host = cand.lower().rsplit("@", 1)[-1]
+        if host.endswith("calendly.com") or host.endswith("google.com"):
+            continue
+        email = cand
+        break
 
     name = grab("invitee name", "invitee", "name")
     if not name:
@@ -509,6 +514,9 @@ def parse_calendly(subject, text):
         name = m.group(1).strip() if m else ""
 
     phone = grab("phone number", "phone", "mobile")
+    if not phone:
+        pm = re.search(r"(\+?\d[\d\s().-]{7,}\d)", text)
+        phone = pm.group(1).strip() if pm else ""
     website = grab("company website", "website", "site", "url")
     when = grab("event date/time", "event date", "date / time", "when")
     etype = grab("event type", "event name")
@@ -518,7 +526,17 @@ def parse_calendly(subject, text):
 
     if not (name or email or phone):
         return None
-    note = " - ".join(x for x in [etype, when, website] if x)
+
+    def tidy(v):
+        """Calendly's body has no blank line before its footer, so a grabbed value
+        runs straight on into 'Need to make changes?' and the unsubscribe copy."""
+        if not v:
+            return ""
+        v = re.split(r"(?i)\s*(?:need to make changes|powered by|reschedule|cancel|"
+                     r"unsubscribe|manage notetaker|view (?:event|invitee))\b", v)[0]
+        return v.strip(" .,-|")[:90]
+
+    note = " - ".join(x for x in [tidy(etype), tidy(when), tidy(website)] if x)
     return {"name": name or "(no name)", "company": "", "city": "",
             "phone": phone, "email": email, "note": note}
 
