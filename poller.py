@@ -75,6 +75,15 @@ OWN_ADDRESSES = ("roham@rghiasi.com", "rg@rghiasi.com",
                  "rohamghiasi@rohamresultsrg.com", "rghiasi@rohamresultsrg.com",
                  "rohamghiasi@rghiasiresults.com", "roham@rghiasiresults.com")
 
+# jq run in Composio's sandbox over an offloaded GMAIL_FETCH_EMAILS file (see poll_direct).
+GMAIL_REPLIES_JQ = (json.dumps([a.lower() for a in OWN_ADDRESSES]) +
+    r' as $own | [.results[0].response.data.messages[] | objects'
+    r' | select(((.messageText // "") | ascii_downcase) as $t | any($own[]; . as $a | $t | contains($a)))'
+    r' | {messageId, sender, subject, messageTimestamp, internalDate, display_url, messageText: ((.messageText // "") as $m'
+    r' | ($m | sub("(?:^|\\n)[ \\t]*(On [^\\n]{0,250}(\\r?\\n[^\\n]{0,250})?wrote:|-{2,}[ \\t]*Original Message'
+    r'|From:[^\\n]*\\r?\\n[ \\t]*(Sent|Date):|_{8,}[ \\t]*\\r?$).*"; ""; "m")) as $c'
+    r' | if ($c | test("\\S")) then $c[0:60000] else $m[0:8000] end)}]')
+
 # Instantly's warmup network tags every warmup subject with a shared token. Secondary
 # belt-and-braces filter only - the In-Reply-To gate above is the real defence, because
 # this token can rotate.
@@ -208,7 +217,7 @@ class MCP:
             if not data:
                 data = r0.get("data_preview") or {}
                 # The preview cuts every long string to "..." - email bodies included.
-                # The whole response is still in the sandbox file; full_text() reads it.
+                # The whole response is still in the sandbox file; from_file() reads it.
                 self.last_file = ((payload.get("data") or {}).get("remote_file_info") or {}).get("file_path")
             return data or {}
         except Exception as e:
@@ -216,20 +225,22 @@ class MCP:
             return {}
 
 
-    def full_text(self, path, jq_path, cap=60000):
-        """Read one string field, uncut, out of an offloaded response file (jq in
-        Composio's sandbox). Returns "" on any failure so the caller keeps the preview."""
+    def from_file(self, path, jq_filter):
+        """Run jq over an offloaded response file in Composio's sandbox and return the
+        parsed JSON. The preview Composio hands back cuts long strings to "..." AND drops
+        whole fields (subject, timestamps), so anything that matters is re-read from the
+        file. Returns None on any failure so the caller keeps the preview."""
         if not path or not re.fullmatch(r"[\w./-]+", path):
-            return ""
+            return None
         res, _ = self._post({"jsonrpc": "2.0", "id": self._nid(), "method": "tools/call",
             "params": {"name": "COMPOSIO_REMOTE_BASH_TOOL", "arguments": {
-                "command": f"jq -r '{jq_path} // empty' {path} | head -c {cap}"}}})
+                "command": f"jq -c '{jq_filter}' {path}"}}})
         try:
             out = json.loads(res["result"]["content"][0]["text"])
-            return ((out.get("data") or {}).get("stdout") or "").rstrip("\n")
+            return json.loads((out.get("data") or {}).get("stdout") or "null")
         except Exception as e:
-            print(f"[WARN] full_text {path}: {e}")
-            return ""
+            print(f"[WARN] from_file {path}: {e}")
+            return None
 
 
 # ----------------------------------------------------------------------------
@@ -797,6 +808,11 @@ def poll_instantly(mcp):
             hit_cap = False
             break
         msg = items[0]
+        if mcp.last_file:                     # offloaded: preview lost the body + timestamps
+            full = mcp.from_file(mcp.last_file, '.results[0].response.data.items[0] | {subject, '
+                                 'timestamp_email, timestamp_created, body: {text: ((.body.text // "")[0:60000])}}')
+            if isinstance(full, dict):
+                msg = {**msg, **{k: v for k, v in full.items() if v}}
         mid = msg.get("id") or msg.get("message_id")
         if mid in seen_ids:                   # cursor didn't advance - stop, don't spin
             hit_cap = False
@@ -819,8 +835,6 @@ def poll_instantly(mcp):
                 # string - handle both so one odd item can't break the parse.
                 body = msg.get("body")
                 body_text = body.get("text") if isinstance(body, dict) else (body if isinstance(body, str) else "")
-                if mcp.last_file and (body_text or "").endswith("..."):
-                    body_text = mcp.full_text(mcp.last_file, ".results[0].response.data.items[0].body.text") or body_text
                 if not body_text and isinstance(body, dict):
                     body_text = html_to_text(body.get("html") or "")
                 note = reply_text(body_text or msg.get("content_preview") or "")
@@ -878,6 +892,15 @@ def poll_direct(mcp):
             print(f"[WARN] direct[{label}] fetch failed: {e}")
             continue
         msgs = gmail_messages(listing)
+        if mcp.last_file:
+            # Offloaded: the preview keeps ~2 of the 15 messages and cuts every body to
+            # "...", so real replies vanished (roham@rohamrg.com "scanned 2"). Re-read the
+            # whole listing from the file, keep only mail that quotes one of Roham's
+            # addresses (warmup never does), and strip the quoted thread in the sandbox so
+            # the response stays small.
+            full = mcp.from_file(mcp.last_file, GMAIL_REPLIES_JQ)
+            if isinstance(full, list):
+                msgs = [dict(m, _quotes_roham=True) for m in full if isinstance(m, dict)]
         kept = 0
         for msg in msgs:
             if (parse_ts(msg.get("messageTimestamp") or msg.get("internalDate")) or OLD) < CUTOFF:
@@ -893,12 +916,9 @@ def poll_direct(mcp):
             H = _headers(msg)
             thread_ref = (H.get("in-reply-to", "") + " " + H.get("references", "")).lower()
             by_header = any(dom in thread_ref for dom in OWN_MSGID_MARKERS)
-            by_quote = any(a in body.lower() for a in OWN_ADDRESSES)
+            by_quote = msg.get("_quotes_roham") or any(a in body.lower() for a in OWN_ADDRESSES)
             if not (by_header or by_quote):
                 continue          # not a reply to anything Roham sent -> not a lead
-            if mcp.last_file and body.endswith("...") and re.fullmatch(r"[\w-]+", msg.get("messageId") or ""):
-                body = mcp.full_text(mcp.last_file, '.results[0].response.data.messages[] | '
-                                     f'select(.messageId=="{msg["messageId"]}") | .messageText') or body
             name = sender.split("<")[0].strip().strip('"') or (email.split("@")[0] if email else "(reply)")
             lead = {"name": name, "company": "", "city": "", "phone": "", "email": email,
                     "subject": subject, "note": reply_text(body),
