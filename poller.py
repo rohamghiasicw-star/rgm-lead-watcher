@@ -159,6 +159,7 @@ class MCP:
                         "X-Consumer-API-Key": key}
         self.session = None
         self._id = 0
+        self.errors = 0          # failed calls; main() won't advance a channel's window past one
         self._handshake()
 
     def _post(self, payload):
@@ -171,6 +172,9 @@ class MCP:
             r = urllib.request.urlopen(req, timeout=90)
         except urllib.error.HTTPError as e:
             print(f"[MCP HTTP {e.code}] {e.read().decode()[:300]}")
+            return None, {}
+        except Exception as e:                       # timeout / connection reset
+            print(f"[MCP NET] {e}")
             return None, {}
         body = None
         for line in r.read().decode().splitlines():
@@ -221,6 +225,7 @@ class MCP:
                 self.last_file = ((payload.get("data") or {}).get("remote_file_info") or {}).get("file_path")
             return data or {}
         except Exception as e:
+            self.errors += 1
             print(f"[ERROR] {tool_slug}: {e} | {json.dumps(res)[:300] if res else 'no response'}")
             return {}
 
@@ -239,6 +244,7 @@ class MCP:
             out = json.loads(res["result"]["content"][0]["text"])
             return json.loads((out.get("data") or {}).get("stdout") or "null")
         except Exception as e:
+            self.errors += 1         # we only have the cut-down preview: hold the window
             print(f"[WARN] from_file {path}: {e}")
             return None
 
@@ -1019,23 +1025,39 @@ def main():
     state = load_state()
     seen = dict(state.get("seen", {}))           # message_id -> iso timestamp seen
     last_run = parse_ts(state.get("last_run"))
-    if last_run and "--dryrun" not in sys.argv:
-        CUTOFF = max(last_run - dt.timedelta(minutes=30), NOW - dt.timedelta(hours=MAX_LOOKBACK_H))
-    else:
-        CUTOFF = NOW - dt.timedelta(minutes=LOOKBACK_MIN)
-    GMAIL_FRESH_H = max(1, int((NOW - CUTOFF).total_seconds() // 3600) + 2)
+    # Each channel remembers the last poll where it read cleanly. A failed read (Composio
+    # 502 outage Oct 5 22:49-02:38 UTC: 18 of 68 polls) must NOT move that channel's
+    # window forward, or mail that landed during the outage is skipped for good. The
+    # window only advances when the channel's calls all succeed; `seen` stops repeats.
+    last_ok = dict(state.get("last_ok", {}))
+
+    def window(fn_name):
+        base = parse_ts(last_ok.get(fn_name)) or last_run
+        if base and "--dryrun" not in sys.argv:
+            return max(base - dt.timedelta(minutes=30), NOW - dt.timedelta(hours=MAX_LOOKBACK_H))
+        return NOW - dt.timedelta(minutes=LOOKBACK_MIN)
 
     # All channels are cheap single calls now (Instantly replaced the 6 Gmail inboxes),
     # so every poll runs the full set - replies alert as fast as DMs. --fast is a no-op.
     fns = [poll_facebook, poll_instagram, poll_wix, poll_site_form, poll_calendly, poll_meta, poll_instantly, poll_direct]
 
-    print(f"[RUN] {NOW.isoformat()} since={CUTOFF.isoformat()} last_run={state.get('last_run')} seen={len(seen)} fast={'--fast' in sys.argv}")
+    print(f"[RUN] {NOW.isoformat()} last_run={state.get('last_run')} held={[k for k, v in last_ok.items() if (parse_ts(v) or NOW) < (last_run or NOW)]} seen={len(seen)} fast={'--fast' in sys.argv}")
     leads = []
     for fn in fns:
+        CUTOFF = window(fn.__name__)
+        GMAIL_FRESH_H = max(1, int((NOW - CUTOFF).total_seconds() // 3600) + 2)
+        before = mcp.errors
         try:
             leads.extend(fn(mcp))
         except Exception as e:
+            mcp.errors += 1
             print(f"[ERROR] {fn.__name__}: {e}")
+        if mcp.errors == before:
+            last_ok[fn.__name__] = NOW.isoformat()
+        else:
+            # pin the window where it is (first failure has no last_ok yet)
+            last_ok.setdefault(fn.__name__, (CUTOFF + dt.timedelta(minutes=30)).isoformat())
+            print(f"[HOLD] {fn.__name__} had a failed read; window stays at {CUTOFF.isoformat()}")
 
     if DRY_RUN:
         seen = {}          # a diagnostic shows everything in the window, alerted or not
@@ -1071,7 +1093,7 @@ def main():
         seen = {k: v for k, v in seen.items() if (parse_ts(v) or NOW) >= cut14}
         cut3 = NOW - dt.timedelta(days=3)
         recent = [r for r in recent if (parse_ts(r[2]) or NOW) >= cut3]
-        save_state({"last_run": NOW.isoformat(), "seen": seen, "recent": recent})
+        save_state({"last_run": NOW.isoformat(), "seen": seen, "recent": recent, "last_ok": last_ok})
         if new:
             # Tells the workflow to commit state NOW, not at the next 15-min checkpoint, so a
             # restart (cancel-in-progress) can't replay alerts sent in the last few polls.
