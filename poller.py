@@ -90,7 +90,7 @@ EXCLUDE_SENDERS = ("noreply", "no-reply", "donotreply", "notification", "mailer-
                    "postmaster", "rohamresults", "rghiasi", "ghiasi@", "roham@",
                    "google.com", "facebook", "wix.com", "paypal", "github",
                    "atlassian", "linkedin", "intuit", "glassdoor", "calendly",
-                   "usebouncer.com", "instantly.ai", "scaledmail")
+                   "usebouncer.com", "instantly.ai", "scaledmail", "rohamghiasi")
 
 NOW = dt.datetime.now(dt.timezone.utc)
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
@@ -289,6 +289,50 @@ def maps_link(company, city):
     return f"https://www.google.com/maps/search/?api=1&query={q}"
 
 
+# Where the quoted history starts in a reply. Everything from the first match down is
+# Roham's own earlier email, so the alert shows the prospect's words in full and stops there.
+_QUOTE_START = re.compile(
+    r"(?im)^[ \t]*On\b[^\n]{0,250}(?:\n[^\n]{0,250})?\bwrote:[ \t]*$"     # Gmail/Apple, may wrap
+    r"|^[ \t]*-{2,}[ \t]*Original Message[ \t]*-{2,}"                    # Outlook classic
+    r"|^[ \t]*From:[^\n]*\n[ \t]*(?:Sent|Date):"                          # Outlook header block
+    r"|^[ \t]*_{8,}[ \t]*$"                                              # Outlook divider
+    r"|^[ \t]*>")                                                       # plain-text quoting
+
+
+def reply_text(body):
+    """The prospect's whole message, uncut, with the quoted thread below it removed.
+    Roham 2026-10-06: "I need to be able to see the full email message, it cant be cut off"
+    - the old alert sliced every reply to 180 characters."""
+    body = (body or "").replace("\r\n", "\n").replace("\r", "\n")
+    m = _QUOTE_START.search(body)
+    text = body[:m.start()] if m else body
+    text = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", text).strip()
+    return text or body.strip()
+
+
+TG_LIMIT = 3900          # Telegram caps a message at 4096 chars; leave room for the (1/2) tag
+
+
+def tg_chunks(text):
+    """Split a long alert on paragraph/line breaks so nothing is lost past Telegram's cap."""
+    if len(text) <= TG_LIMIT:
+        return [text]
+    out, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > TG_LIMIT:                      # one monster line: hard-split it
+            if cur:
+                out.append(cur); cur = ""
+            out.append(line[:TG_LIMIT]); line = line[TG_LIMIT:]
+        if len(cur) + len(line) + 1 > TG_LIMIT:
+            out.append(cur); cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        out.append(cur)
+    n = len(out)
+    return [f"({i}/{n})\n{c}" if i > 1 else f"{c}\n({i}/{n})" for i, c in enumerate(out, 1)]
+
+
 def send_telegram(mcp, source, lead):
     who = " - ".join(x for x in [lead.get("name"), lead.get("company")] if x) or lead.get("name", "(lead)")
     parts = [f"NEW LEAD ({source})", who]
@@ -299,17 +343,22 @@ def send_telegram(mcp, source, lead):
     if lead.get("email"):
         parts.append("Email: " + lead["email"])
     if lead.get("note"):
+        parts.append("")                       # blank line, then the message itself
         parts.append(lead["note"])
+        parts.append("")
     if lead.get("company") or lead.get("city"):
         parts.append("GBP check: " + maps_link(lead.get("company", ""), lead.get("city", "")))
     if lead.get("link"):
-        parts.append("Open email (full details/phone): " + lead["link"])
+        parts.append("Open email: " + lead["link"])
+    chunks = tg_chunks("\n".join(parts))
     if DRY_RUN:
-        print(f"[WOULD ALERT] {source}: {who} | {lead.get('phone','')} | {lead.get('email','')}")
-        print("[WOULD SEND] " + " || ".join(parts))
+        print(f"[WOULD ALERT] {source}: {who} | {lead.get('phone','')} | {lead.get('email','')} | {len(chunks)} msg(s)")
+        for c in chunks:
+            print("[WOULD SEND] " + c.replace("\n", " || "))
         return
-    mcp.execute("TELEGRAM_SEND_MESSAGE", {"chat_id": TELEGRAM_CHAT_ID, "text": "\n".join(parts)})
-    print(f"[SENT] {source}: {who}")
+    for c in chunks:
+        mcp.execute("TELEGRAM_SEND_MESSAGE", {"chat_id": TELEGRAM_CHAT_ID, "text": c})
+    print(f"[SENT] {source}: {who} ({len(chunks)} msg)")
 
 
 # ----------------------------------------------------------------------------
@@ -744,9 +793,12 @@ def poll_instantly(mcp):
                 # string - handle both so one odd item can't break the parse.
                 body = msg.get("body")
                 body_text = body.get("text") if isinstance(body, dict) else (body if isinstance(body, str) else "")
-                note = (msg.get("content_preview") or body_text or "").strip()[:180]
+                if not body_text and isinstance(body, dict):
+                    body_text = html_to_text(body.get("html") or "")
+                note = reply_text(body_text or msg.get("content_preview") or "")
                 lead = {"name": name, "company": "", "city": "", "phone": "", "email": email,
                         "subject": msg.get("subject", ""), "note": note,
+                        "received": iso(parse_ts(msg.get("timestamp_email")) or t),
                         "link": "https://app.instantly.ai/app/unibox"}
                 leads.append(("Cold-email reply", lead, mid))
         except Exception as e:
@@ -818,7 +870,8 @@ def poll_direct(mcp):
                 continue          # not a reply to anything Roham sent -> not a lead
             name = sender.split("<")[0].strip().strip('"') or (email.split("@")[0] if email else "(reply)")
             lead = {"name": name, "company": "", "city": "", "phone": "", "email": email,
-                    "subject": subject, "note": body.strip()[:180],
+                    "subject": subject, "note": reply_text(body),
+                    "received": iso(parse_ts(msg.get("messageTimestamp") or msg.get("internalDate"))),
                     "link": msg.get("display_url", "")}
             leads.append((f"Direct reply ({label})", lead, msg.get("messageId")))
             kept += 1
@@ -869,6 +922,29 @@ def selftest(mcp):
     sys.exit(0 if all_ok else 1)
 
 
+DUP_WINDOW = dt.timedelta(minutes=20)
+
+
+def iso(t):
+    return t.isoformat() if t else ""
+
+
+def fingerprint(lead):
+    email = (lead.get("email") or "").strip().lower()
+    if not email:
+        return None
+    subj = re.sub(r"^\s*(?:(?:re|fw|fwd|aw)\s*:\s*)+", "", (lead.get("subject") or "").lower())
+    subj = re.sub(r"\W+", " ", subj).strip()
+    return [email, subj, lead.get("received") or NOW.isoformat()]
+
+
+def is_same_email(a, b):
+    if a[0] != b[0] or a[1] != b[1]:
+        return False
+    ta, tb = parse_ts(a[2]), parse_ts(b[2])
+    return bool(ta and tb and abs(ta - tb) <= DUP_WINDOW)
+
+
 def main():
     if not CONSUMER_KEY:
         print("[FATAL] COMPOSIO_CONSUMER_KEY is not set.")
@@ -904,22 +980,45 @@ def main():
         except Exception as e:
             print(f"[ERROR] {fn.__name__}: {e}")
 
-    new = 0
+    if DRY_RUN:
+        seen = {}          # a diagnostic shows everything in the window, alerted or not
+    # ONE ALERT PER EMAIL, whichever channel sees it first. Roham's sending inboxes are
+    # connected to Instantly AND to Composio Gmail, so the same reply arrives twice: once
+    # in the unibox (poll_instantly) and once in the inbox (poll_direct), with different
+    # ids. 18 leads double-pinged Sep 18 - Oct 2 (Costa, Dripp, Onley, Schultz...).
+    # Same sender + same subject + sent within DUP_WINDOW = the same email.
+    recent = [] if DRY_RUN else list(state.get("recent", []))   # [email, subject, sent_iso]
+    leads.sort(key=lambda x: not x[0].startswith("Direct"))     # Gmail copy wins: real thread link
+    new = dupes = 0
     for source, lead, did in leads:
         key = did or json.dumps(lead, sort_keys=True)
         if key in seen:
             continue
+        seen[key] = NOW.isoformat()
+        fp = fingerprint(lead)
+        if fp and any(is_same_email(fp, r) for r in recent):
+            dupes += 1
+            print(f"[DUP] {source}: {lead.get('email')} {lead.get('subject','')!r} already alerted")
+            continue
+        if fp:
+            recent.append(fp)
         send_telegram(mcp, source, lead)
         if not DRY_RUN:
             save_lead(source, lead, did)
-        seen[key] = NOW.isoformat()
         new += 1
-    print(f"[DONE] {new} new lead(s) sent." if new else "[DONE] No new leads.")
+    print((f"[DONE] {new} new lead(s) sent." if new else "[DONE] No new leads.")
+          + (f" {dupes} duplicate(s) suppressed." if dupes else ""))
 
     if not DRY_RUN:
         cut14 = NOW - dt.timedelta(days=14)
         seen = {k: v for k, v in seen.items() if (parse_ts(v) or NOW) >= cut14}
-        save_state({"last_run": NOW.isoformat(), "seen": seen})
+        cut3 = NOW - dt.timedelta(days=3)
+        recent = [r for r in recent if (parse_ts(r[2]) or NOW) >= cut3]
+        save_state({"last_run": NOW.isoformat(), "seen": seen, "recent": recent})
+        if new:
+            # Tells the workflow to commit state NOW, not at the next 15-min checkpoint, so a
+            # restart (cancel-in-progress) can't replay alerts sent in the last few polls.
+            open(".alerted", "w").close()
 
 
 if __name__ == "__main__":
