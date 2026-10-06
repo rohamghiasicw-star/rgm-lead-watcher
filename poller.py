@@ -187,6 +187,7 @@ class MCP:
         item = {"tool_slug": tool_slug, "arguments": arguments}
         if account:
             item["account"] = account
+        self.last_file = None
         res, _ = self._post({"jsonrpc": "2.0", "id": self._nid(), "method": "tools/call",
             "params": {"name": "COMPOSIO_MULTI_EXECUTE_TOOL", "arguments": {
                 "thought": "lead poll", "current_step": "POLL",
@@ -206,10 +207,29 @@ class MCP:
             data = r0.get("data")
             if not data:
                 data = r0.get("data_preview") or {}
+                # The preview cuts every long string to "..." - email bodies included.
+                # The whole response is still in the sandbox file; full_text() reads it.
+                self.last_file = ((payload.get("data") or {}).get("remote_file_info") or {}).get("file_path")
             return data or {}
         except Exception as e:
             print(f"[ERROR] {tool_slug}: {e} | {json.dumps(res)[:300] if res else 'no response'}")
             return {}
+
+
+    def full_text(self, path, jq_path, cap=60000):
+        """Read one string field, uncut, out of an offloaded response file (jq in
+        Composio's sandbox). Returns "" on any failure so the caller keeps the preview."""
+        if not path or not re.fullmatch(r"[\w./-]+", path):
+            return ""
+        res, _ = self._post({"jsonrpc": "2.0", "id": self._nid(), "method": "tools/call",
+            "params": {"name": "COMPOSIO_REMOTE_BASH_TOOL", "arguments": {
+                "command": f"jq -r '{jq_path} // empty' {path} | head -c {cap}"}}})
+        try:
+            out = json.loads(res["result"]["content"][0]["text"])
+            return ((out.get("data") or {}).get("stdout") or "").rstrip("\n")
+        except Exception as e:
+            print(f"[WARN] full_text {path}: {e}")
+            return ""
 
 
 # ----------------------------------------------------------------------------
@@ -306,8 +326,14 @@ def reply_text(body):
     body = (body or "").replace("\r\n", "\n").replace("\r", "\n")
     m = _QUOTE_START.search(body)
     text = body[:m.start()] if m else body
-    text = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", text).strip()
-    return text or body.strip()
+    if m and not text.strip():
+        # Nothing above the quote: either an inline reply (their lines sit between the
+        # quoted ">" lines) or a photo/attachment-only email.
+        inline = [ln for ln in body[m.end():].split("\n")
+                  if ln.strip() and not ln.lstrip().startswith(">") and not _QUOTE_START.match(ln)]
+        text = ("(reply written inside the quoted email)\n" + "\n".join(inline)) if inline \
+            else "(no typed text - probably a photo or attachment, open the email)"
+    return re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", text).strip()
 
 
 TG_LIMIT = 3900          # Telegram caps a message at 4096 chars; leave room for the (1/2) tag
@@ -793,6 +819,8 @@ def poll_instantly(mcp):
                 # string - handle both so one odd item can't break the parse.
                 body = msg.get("body")
                 body_text = body.get("text") if isinstance(body, dict) else (body if isinstance(body, str) else "")
+                if mcp.last_file and (body_text or "").endswith("..."):
+                    body_text = mcp.full_text(mcp.last_file, ".results[0].response.data.items[0].body.text") or body_text
                 if not body_text and isinstance(body, dict):
                     body_text = html_to_text(body.get("html") or "")
                 note = reply_text(body_text or msg.get("content_preview") or "")
@@ -868,6 +896,9 @@ def poll_direct(mcp):
             by_quote = any(a in body.lower() for a in OWN_ADDRESSES)
             if not (by_header or by_quote):
                 continue          # not a reply to anything Roham sent -> not a lead
+            if mcp.last_file and body.endswith("...") and re.fullmatch(r"[\w-]+", msg.get("messageId") or ""):
+                body = mcp.full_text(mcp.last_file, '.results[0].response.data.messages[] | '
+                                     f'select(.messageId=="{msg["messageId"]}") | .messageText') or body
             name = sender.split("<")[0].strip().strip('"') or (email.split("@")[0] if email else "(reply)")
             lead = {"name": name, "company": "", "city": "", "phone": "", "email": email,
                     "subject": subject, "note": reply_text(body),
@@ -922,7 +953,7 @@ def selftest(mcp):
     sys.exit(0 if all_ok else 1)
 
 
-DUP_WINDOW = dt.timedelta(minutes=20)
+DUP_WINDOW = dt.timedelta(minutes=5)   # both copies carry the email's own send time
 
 
 def iso(t):
@@ -935,14 +966,20 @@ def fingerprint(lead):
         return None
     subj = re.sub(r"^\s*(?:(?:re|fw|fwd|aw)\s*:\s*)+", "", (lead.get("subject") or "").lower())
     subj = re.sub(r"\W+", " ", subj).strip()
-    return [email, subj, lead.get("received") or NOW.isoformat()]
+    # First 60 letters/digits of the message: a back-and-forth (Jason sent 12 replies in
+    # 90 min on Oct 5) shares sender + subject + time but never the same words.
+    words = re.sub(r"[\W_]+", "", (lead.get("note") or "").lower())[:60]
+    return [email, subj, lead.get("received") or NOW.isoformat(), words]
 
 
 def is_same_email(a, b):
     if a[0] != b[0] or a[1] != b[1]:
         return False
     ta, tb = parse_ts(a[2]), parse_ts(b[2])
-    return bool(ta and tb and abs(ta - tb) <= DUP_WINDOW)
+    if not (ta and tb and abs(ta - tb) <= DUP_WINDOW):
+        return False
+    wa, wb = (a[3] if len(a) > 3 else ""), (b[3] if len(b) > 3 else "")
+    return not wa or not wb or wa.startswith(wb) or wb.startswith(wa)
 
 
 def main():
