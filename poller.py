@@ -101,6 +101,12 @@ EXCLUDE_SENDERS = ("noreply", "no-reply", "donotreply", "notification", "mailer-
                    "atlassian", "linkedin", "intuit", "glassdoor", "calendly",
                    "usebouncer.com", "instantly.ai", "scaledmail", "rohamghiasi")
 
+# Current clients. Their mail is work, not a lead (Roham 2026-10-20: "if im getting
+# emails from my current clients i dont want them to be marked as a lead email").
+# Substring match on the sender address, same as EXCLUDE_SENDERS. Add a client here
+# the day they sign; remove them the day they leave.
+CLIENT_SENDERS = ("localmoversbc.ca", "alwaysbestmoving", "picasshomepainting", "tsanner@gmail.com", "copainting", "everfinish", "westernprovincialmovers", "diamond54@shaw.ca", "mambadrainage", "torontorestoration1@gmail.com", "dripp-plumbing", "ld-movers.com")
+
 NOW = dt.datetime.now(dt.timezone.utc)
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 MAX_LOOKBACK_H = 72                  # safety cap if runs were paused a long time
@@ -586,6 +592,48 @@ def html_to_text(v):
     return re.sub(r"[ \t\r\f\v]+", " ", v).strip()
 
 
+HOST_TZ = "America/Toronto"   # the Calendly account's time zone; its emails use it
+HOME_TZ = "Asia/Makassar"     # Bali, UTC+8, no daylight saving
+
+
+def bali_time(when):
+    """Calendly's booking time -> the same moment in Bali, with the weekday.
+
+    Roham 2026-10-20: "i want bookings in calendar to tell me the time in bali time
+    and the day". Calendly writes the time in the HOST's zone (Eastern), in one of
+    two shapes: '12:00 Wed, 21 Oct 2026' (subject) or '10:00am - Monday, October
+    20, 2026' (body). Anything it can't read returns '' and the alert keeps the
+    original text, so a format change never hides a booking.
+    """
+    if not when:
+        return ""
+    try:
+        from zoneinfo import ZoneInfo
+    except Exception:
+        return ""
+    w = when.replace("\u00a0", " ")
+    m = re.search(r"(\d{1,2}):(\d{2})\s*([ap]m)?", w, re.I)
+    d1 = re.search(r"(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})", w)
+    d2 = re.search(r"([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})", w)
+    if not m or not (d1 or d2):
+        return ""
+    hh, mm = int(m.group(1)), int(m.group(2))
+    if m.group(3):
+        hh = hh % 12 + (12 if m.group(3).lower() == "pm" else 0)
+    if d1:
+        day, mon, yr = int(d1.group(1)), d1.group(2), int(d1.group(3))
+    else:
+        mon, day, yr = d2.group(1), int(d2.group(2)), int(d2.group(3))
+    try:
+        mon_n = dt.datetime.strptime(mon[:3], "%b").month
+        local = dt.datetime(yr, mon_n, day, hh, mm, tzinfo=ZoneInfo(HOST_TZ))
+    except Exception:
+        return ""
+    b = local.astimezone(ZoneInfo(HOME_TZ))
+    return (b.strftime("%a %d %b, %I:%M %p").replace(" 0", " ").lstrip("0")
+            .replace("AM", "am").replace("PM", "pm") + " Bali time")
+
+
 def parse_calendly(subject, text):
     """Calendly's host notification for a NEW booking.
 
@@ -656,7 +704,9 @@ def parse_calendly(subject, text):
                      r"unsubscribe|manage notetaker|view (?:event|invitee))\b", v)[0]
         return v.strip(" .,-|")[:90]
 
-    bits = [tidy(etype), tidy(when), tidy(website)]
+    bali = bali_time(tidy(when))
+    when_bit = (bali + " (" + tidy(when) + " Toronto)") if bali else tidy(when)
+    bits = [tidy(etype), when_bit, tidy(website)]
     if not email and not phone:
         bits.append("contact details are in the email, tap below")
     note = " - ".join(x for x in bits if x)
@@ -831,7 +881,7 @@ def poll_instantly(mcp):
             break
         try:
             email = (msg.get("from_address_email") or "").strip()
-            if not any(x in email.lower() for x in EXCLUDE_SENDERS):
+            if not any(x in email.lower() for x in EXCLUDE_SENDERS + CLIENT_SENDERS):
                 frm = msg.get("from_address_json") or []
                 first = frm[0] if isinstance(frm, list) and frm and isinstance(frm[0], dict) else {}
                 name = (first.get("name") or "").strip()
@@ -913,7 +963,7 @@ def poll_direct(mcp):
                 continue
             sender = (msg.get("sender") or "")
             email = sender.split("<")[-1].rstrip(">").strip().lower() if "<" in sender else sender.strip().lower()
-            if any(x in email for x in EXCLUDE_SENDERS):
+            if any(x in email for x in EXCLUDE_SENDERS + CLIENT_SENDERS):
                 continue
             subject = msg.get("subject") or ""
             if any(tag in subject for tag in WARMUP_SUBJECT_TAGS):
