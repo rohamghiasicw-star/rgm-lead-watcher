@@ -27,6 +27,7 @@ on:
 
 permissions:
   contents: write
+  actions: write      # lets the loop dispatch its own successor (2026-11-16)
 
 concurrency:
   group: lead-watcher
@@ -44,6 +45,7 @@ jobs:
 
       - name: Poll every 15 minutes
         env:
+          GH_TOKEN: ${{ github.token }}
           COMPOSIO_CONSUMER_KEY: ${{ secrets.COMPOSIO_CONSUMER_KEY }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
@@ -60,7 +62,7 @@ jobs:
           fi
           git config user.name "rgm-lead-watcher"
           git config user.email "actions@users.noreply.github.com"
-          END=$(( $(date +%s) + 20400 ))    # ~5h40m, then exit & get restarted by the schedule
+          END=$(( $(date +%s) + 20400 ))    # ~5h40m, then exit and dispatch the next loop (cron is only the fallback)
           i=0
           while [ "$(date +%s)" -lt "$END" ]; do
             echo "::group::poll $(date -u +%FT%TZ) i=$i"
@@ -81,3 +83,14 @@ jobs:
             i=$(( i + 1 ))
             sleep 180
           done
+          # 2026-11-16: never wait on GitHub cron to restart the loop. Cron left a 4h08m hole
+          # (12:17Z to 16:25Z) and a lead that replied at 14:41Z pinged ~1h45m late.
+          # Save state, then dispatch the next loop ourselves; it cancels this finished run.
+          if [ -n "$(git status --porcelain state.json leads.jsonl)" ]; then
+            git add state.json leads.jsonl
+            git commit -m "state [skip ci]" >/dev/null 2>&1
+            git pull --rebase --autostash >/dev/null 2>&1
+            git push >/dev/null 2>&1 || true
+          fi
+          gh workflow run lead-poller.yml --ref main || echo "self-dispatch failed, cron will restart"
+          sleep 60
