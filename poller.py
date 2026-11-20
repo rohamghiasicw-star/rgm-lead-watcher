@@ -99,7 +99,8 @@ EXCLUDE_SENDERS = ("noreply", "no-reply", "donotreply", "notification", "mailer-
                    "postmaster", "rohamresults", "rghiasi", "ghiasi@", "roham@",
                    "google.com", "facebook", "wix.com", "paypal", "github",
                    "atlassian", "linkedin", "intuit", "glassdoor", "calendly",
-                   "usebouncer.com", "instantly.ai", "scaledmail", "rohamghiasi")
+                   "usebouncer.com", "instantly.ai", "scaledmail", "rohamghiasi",
+                   "alignable.com")
 
 # Current clients. Their mail is work, not a lead (Roham 2026-10-20: "if im getting
 # emails from my current clients i dont want them to be marked as a lead email").
